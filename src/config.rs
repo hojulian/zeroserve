@@ -14,6 +14,7 @@ pub struct StaticConfig {
     pub chunk_size: usize,
     pub try_html: bool,
     pub disable_request_logging: bool,
+    pub enable_proxy_protocol: bool,
 }
 
 impl TryFrom<Cli> for StaticConfig {
@@ -55,6 +56,7 @@ impl TryFrom<Cli> for StaticConfig {
             chunk_size: cli.chunk_size.max(1024),
             try_html: cli.try_html,
             disable_request_logging: cli.disable_request_logging,
+            enable_proxy_protocol: cli.enable_proxy_protocol,
         })
     }
 }

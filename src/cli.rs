@@ -49,4 +49,8 @@ pub struct Cli {
     /// Disable per-request logging.
     #[arg(long)]
     pub disable_request_logging: bool,
+
+    /// Expect a PROXY protocol v1 header before the first request on each connection.
+    #[arg(long)]
+    pub enable_proxy_protocol: bool,
 }

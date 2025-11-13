@@ -1,6 +1,7 @@
 use std::{
     cell::RefCell,
     io::ErrorKind,
+    net::{IpAddr, Ipv4Addr, Ipv6Addr},
     os::fd::AsFd,
     rc::Rc,
     sync::{Arc, Weak},
@@ -12,10 +13,10 @@ use http::{Method, StatusCode, Uri};
 use monoio::{
     fs::File,
     io::{
-        AsyncReadRent, AsyncWriteRent, AsyncWriteRentExt, Split, Splitable, sink::SinkExt,
-        stream::Stream,
+        AsyncReadRent, AsyncReadRentExt, AsyncWriteRent, AsyncWriteRentExt, Split, Splitable,
+        sink::SinkExt, stream::Stream,
     },
-    net::TcpListener,
+    net::{TcpListener, TcpStream},
 };
 use monoio_http::{
     common::{
@@ -62,8 +63,22 @@ async fn run_http_listener(shared: Arc<SharedState>) -> Result<()> {
         }
         let state = shared.clone();
         monoio::spawn(async move {
-            if let Err(err) = handle_connection(stream, addr, state, Scheme::Http).await {
-                eprintln!("connection {} over http closed with error: {err:?}", addr);
+            let mut stream = stream;
+            let peer = if state.config.enable_proxy_protocol {
+                match read_proxy_protocol_peer(&mut stream, addr).await {
+                    Ok(peer) => peer,
+                    Err(err) => {
+                        eprintln!(
+                            "dropping http connection {addr} due to invalid PROXY header: {err}"
+                        );
+                        return;
+                    }
+                }
+            } else {
+                addr
+            };
+            if let Err(err) = handle_connection(stream, peer, state, Scheme::Http).await {
+                eprintln!("connection {} over http closed with error: {err:?}", peer);
             }
         });
     }
@@ -81,22 +96,36 @@ async fn run_tls_listener(shared: Arc<SharedState>) -> Result<()> {
         let (stream, peer) = listener.accept().await?;
         let state = shared.clone();
         monoio::spawn(async move {
+            let mut stream = stream;
+            let reported_peer = if state.config.enable_proxy_protocol {
+                match read_proxy_protocol_peer(&mut stream, peer).await {
+                    Ok(addr) => addr,
+                    Err(err) => {
+                        eprintln!(
+                            "dropping TLS connection {peer} due to invalid PROXY header: {err}"
+                        );
+                        return;
+                    }
+                }
+            } else {
+                peer
+            };
             let tls_state = match state.tls.load_full() {
                 Some(runtime) => runtime,
                 None => {
-                    eprintln!("dropping TLS connection {peer} due to missing TLS config");
+                    eprintln!("dropping TLS connection {reported_peer} due to missing TLS config");
                     return;
                 }
             };
             match tls_state.acceptor.accept(stream).await {
                 Ok(tls_stream) => {
                     if let Err(err) =
-                        handle_connection(tls_stream, peer, state, Scheme::Https).await
+                        handle_connection(tls_stream, reported_peer, state, Scheme::Https).await
                     {
-                        eprintln!("TLS conn {peer} closed with error: {err:?}");
+                        eprintln!("TLS conn {reported_peer} closed with error: {err:?}");
                     }
                 }
-                Err(err) => log_tls_error(peer, err),
+                Err(err) => log_tls_error(reported_peer, err),
             }
         });
     }
@@ -325,5 +354,80 @@ impl Scheme {
             Scheme::Http => "http",
             Scheme::Https => "https",
         }
+    }
+}
+
+const MAX_PROXY_LINE_LEN: usize = 108;
+
+async fn read_proxy_protocol_peer(
+    stream: &mut TcpStream,
+    fallback: std::net::SocketAddr,
+) -> Result<std::net::SocketAddr> {
+    let mut line = Vec::with_capacity(MAX_PROXY_LINE_LEN);
+    let mut buffer = Box::new([0u8; 1]);
+    while line.len() < MAX_PROXY_LINE_LEN {
+        let (res, buf) = stream.read_exact(buffer).await;
+        buffer = buf;
+        res.map_err(|e| anyhow!("failed to read PROXY header: {e}"))?;
+        let byte = buffer[0];
+        line.push(byte);
+        let len = line.len();
+        if len >= 2 && line[len - 2] == b'\r' && line[len - 1] == b'\n' {
+            let header = std::str::from_utf8(&line).context("PROXY header must be valid ASCII")?;
+            return parse_proxy_protocol_v1(header, fallback);
+        }
+    }
+    Err(anyhow!(
+        "PROXY header exceeded {MAX_PROXY_LINE_LEN} bytes before newline"
+    ))
+}
+
+fn parse_proxy_protocol_v1(
+    header: &str,
+    fallback: std::net::SocketAddr,
+) -> Result<std::net::SocketAddr> {
+    let header = header.trim_end_matches("\r\n");
+    let mut parts = header.split_whitespace();
+    let prefix = parts
+        .next()
+        .ok_or_else(|| anyhow!("received empty PROXY header"))?;
+    if prefix != "PROXY" {
+        return Err(anyhow!("invalid PROXY header prefix: {prefix}"));
+    }
+    let family = parts
+        .next()
+        .ok_or_else(|| anyhow!("missing PROXY protocol family"))?;
+    match family {
+        "UNKNOWN" => Ok(fallback),
+        "TCP4" | "TCP6" => {
+            let src_ip = parts
+                .next()
+                .ok_or_else(|| anyhow!("missing source address in PROXY header"))?;
+            let _dst_ip = parts
+                .next()
+                .ok_or_else(|| anyhow!("missing destination address in PROXY header"))?;
+            let src_port = parts
+                .next()
+                .ok_or_else(|| anyhow!("missing source port in PROXY header"))?;
+            let _dst_port = parts
+                .next()
+                .ok_or_else(|| anyhow!("missing destination port in PROXY header"))?;
+            let port: u16 = src_port
+                .parse()
+                .map_err(|e| anyhow!("invalid source port in PROXY header: {e}"))?;
+            let addr = if family == "TCP4" {
+                let ip: Ipv4Addr = src_ip
+                    .parse()
+                    .map_err(|e| anyhow!("invalid IPv4 in PROXY header: {e}"))?;
+                std::net::SocketAddr::new(IpAddr::V4(ip), port)
+            } else {
+                let ip: Ipv6Addr = src_ip
+                    .parse()
+                    .map_err(|e| anyhow!("invalid IPv6 in PROXY header: {e}"))?;
+                std::net::SocketAddr::new(IpAddr::V6(ip), port)
+            };
+            Ok(addr)
+        }
+        other => Err(anyhow!("unsupported PROXY protocol family: {other}")),
     }
 }

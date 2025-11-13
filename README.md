@@ -30,6 +30,9 @@ zeroserve --addr 0.0.0.0:8080 --tls-addr 0.0.0.0:8443 --cert certificate.pem --k
 # Fall back to <path>.html when a request path is missing
 zeroserve --addr 0.0.0.0:8080 --try-html site.tar
 
+# Honor PROXY protocol v1 headers (e.g. when behind a TCP load balancer)
+zeroserve --enable-proxy-protocol site.tar
+
 # Hot-reload certificate and site tarball
 killall -SIGHUP zeroserve
 ```

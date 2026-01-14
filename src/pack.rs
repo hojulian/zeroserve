@@ -148,7 +148,15 @@ fn compile_script(source: &Path, temp_dir: &Path, header_dir: &Path) -> Result<C
     let obj_path = temp_dir.join(format!("{}-{}.o", stem, unique));
 
     let clang_status = Command::new("clang")
-        .args(["-O2", "-target", "bpf", "-emit-llvm", "-c"])
+        .args([
+            "-O2",
+            "-Wall",
+            "-target",
+            "bpf",
+            "-fno-builtin-memcpy",
+            "-emit-llvm",
+            "-c",
+        ])
         .arg("-I")
         .arg(header_dir)
         .arg(source)

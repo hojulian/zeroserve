@@ -85,4 +85,8 @@ pub struct Cli {
     /// Enable io_uring sqpoll with the provided idle timeout.
     #[arg(long)]
     pub sqpoll_idle_ms: Option<u32>,
+
+    /// Disable proxy protocol decoding fast path for debugging.
+    #[arg(long)]
+    pub debug_proxy_protocol_disable_fast_path: bool,
 }

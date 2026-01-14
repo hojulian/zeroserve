@@ -3,6 +3,7 @@ use std::{
     collections::HashMap,
     io::ErrorKind,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs},
+    os::fd::AsRawFd,
     rc::Rc,
     sync::{Arc, Weak},
     time::Duration,
@@ -10,12 +11,13 @@ use std::{
 
 use anyhow::{Context, Result, anyhow};
 use bytes::Bytes;
-use futures::{FutureExt, channel::oneshot};
+use futures::channel::oneshot;
 use http::{
     Method, StatusCode, Uri,
     header::{HeaderName, HeaderValue},
 };
 use monoio::{
+    buf::SliceMut,
     fs::File,
     io::{
         AsyncReadRent, AsyncReadRentExt, AsyncWriteRent, AsyncWriteRentExt, Split, Splitable,
@@ -41,35 +43,40 @@ use monoio_http::{
     },
 };
 use monoio_rustls::{ClientTlsStream, TlsConnector, TlsError};
-use rayon::ThreadPool;
 use rustls::{ClientConfig, RootCertStore, pki_types::ServerName};
 use ulid::Ulid;
 use url::Url;
 
 use crate::{
+    config::StaticConfig,
     logging::async_log,
     pool::{self, PoolKey, PooledConnection},
-    script::{ScriptOutcome, ScriptRequest, ScriptResponse},
-    shared::SharedState,
+    script::{ScriptOutcome, ScriptRequest, ScriptResponse, ScriptRuntime},
+    shared::{SharedState, read_tar_entry},
     site::{Site, TarEntry, guess_mime, normalize_request_path},
+    thread_pool::DNS_TP,
 };
 
 type HttpBody = Payload<Bytes, HttpError>;
 
-pub async fn amain(shared: Arc<SharedState>) -> Result<()> {
+pub async fn amain(shared: Arc<SharedState>, script_runtime: Rc<ScriptRuntime>) -> Result<()> {
     if shared.config.tls_addr.is_some() {
         let tls_state = shared.clone();
+        let script_runtime = script_runtime.clone();
         monoio::spawn(async move {
-            if let Err(err) = run_tls_listener(tls_state).await {
+            if let Err(err) = run_tls_listener(tls_state, script_runtime).await {
                 eprintln!("TLS listener stopped: {err:?}");
             }
         });
     }
 
-    run_http_listener(shared).await
+    run_http_listener(shared, script_runtime).await
 }
 
-async fn run_http_listener(shared: Arc<SharedState>) -> Result<()> {
+async fn run_http_listener(
+    shared: Arc<SharedState>,
+    script_runtime: Rc<ScriptRuntime>,
+) -> Result<()> {
     let listener = shared
         .http_listener
         .lock()
@@ -83,11 +90,13 @@ async fn run_http_listener(shared: Arc<SharedState>) -> Result<()> {
         if stream.set_nodelay(true).is_err() {
             continue;
         }
+        let hup = shared.hup.wait(stream.as_raw_fd())?;
         let state = shared.clone();
+        let script_runtime = script_runtime.clone();
         monoio::spawn(async move {
             let mut stream = stream;
             let peer = if state.config.enable_proxy_protocol {
-                match read_proxy_protocol_peer(&mut stream, addr).await {
+                match read_proxy_protocol_peer(&mut stream, addr, &state.config).await {
                     Ok(peer) => peer,
                     Err(err) => {
                         eprintln!(
@@ -99,14 +108,19 @@ async fn run_http_listener(shared: Arc<SharedState>) -> Result<()> {
             } else {
                 addr
             };
-            if let Err(err) = handle_connection(stream, peer, state, Scheme::Http).await {
+            if let Err(err) =
+                handle_connection(hup, stream, peer, state, Scheme::Http, script_runtime).await
+            {
                 eprintln!("connection {} over http closed with error: {err:?}", peer);
             }
         });
     }
 }
 
-async fn run_tls_listener(shared: Arc<SharedState>) -> Result<()> {
+async fn run_tls_listener(
+    shared: Arc<SharedState>,
+    script_runtime: Rc<ScriptRuntime>,
+) -> Result<()> {
     let addr = shared
         .config
         .tls_addr
@@ -121,11 +135,16 @@ async fn run_tls_listener(shared: Arc<SharedState>) -> Result<()> {
     eprintln!("listening on https://{}", addr);
     loop {
         let (stream, peer) = listener.accept().await?;
+        if stream.set_nodelay(true).is_err() {
+            continue;
+        }
+        let hup = shared.hup.wait(stream.as_raw_fd())?;
         let state = shared.clone();
+        let script_runtime = script_runtime.clone();
         monoio::spawn(async move {
             let mut stream = stream;
             let reported_peer = if state.config.enable_proxy_protocol {
-                match read_proxy_protocol_peer(&mut stream, peer).await {
+                match read_proxy_protocol_peer(&mut stream, peer, &state.config).await {
                     Ok(addr) => addr,
                     Err(err) => {
                         eprintln!(
@@ -146,8 +165,15 @@ async fn run_tls_listener(shared: Arc<SharedState>) -> Result<()> {
             };
             match tls_state.acceptor.accept(stream).await {
                 Ok(tls_stream) => {
-                    if let Err(err) =
-                        handle_connection(tls_stream, reported_peer, state, Scheme::Https).await
+                    if let Err(err) = handle_connection(
+                        hup,
+                        tls_stream,
+                        reported_peer,
+                        state,
+                        Scheme::Https,
+                        script_runtime,
+                    )
+                    .await
                     {
                         eprintln!("TLS conn {reported_peer} closed with error: {err:?}");
                     }
@@ -168,10 +194,12 @@ fn log_tls_error(peer: std::net::SocketAddr, error: TlsError) {
 }
 
 async fn handle_connection<IO>(
+    mut hup: impl Future<Output = ()> + Unpin + 'static,
     io: IO,
     peer: std::net::SocketAddr,
     shared: Arc<SharedState>,
     scheme: Scheme,
+    script_runtime: Rc<ScriptRuntime>,
 ) -> Result<()>
 where
     IO: AsyncReadRent + AsyncWriteRent + Split + 'static,
@@ -181,8 +209,19 @@ where
     while let Some(result) = decoder.next().await {
         match result {
             Ok(request) => {
-                let interrupt = decoder.next().map(|_| ());
-                handle_request(request, &shared, peer, scheme, &mut w, interrupt).await;
+                let can_continue = handle_request(
+                    request,
+                    &shared,
+                    &script_runtime,
+                    peer,
+                    scheme,
+                    &mut w,
+                    &mut hup,
+                )
+                .await;
+                if !can_continue {
+                    break;
+                }
             }
             Err(err) => {
                 if let HttpError::IOError(x) = &err {
@@ -207,11 +246,12 @@ where
 async fn handle_request(
     req: Request,
     shared: &Arc<SharedState>,
+    script_runtime: &Rc<ScriptRuntime>,
     peer: std::net::SocketAddr,
     scheme: Scheme,
     w: &mut impl AsyncWriteRent,
-    interrupt: impl Future<Output = ()>,
-) {
+    interrupt: &mut (impl Future<Output = ()> + Unpin),
+) -> bool {
     let request_id = Ulid::new();
     if !shared.config.disable_request_logging {
         log_request(request_id, peer, scheme, req.method(), req.uri()).await;
@@ -223,8 +263,11 @@ async fn handle_request(
     let script_request = build_script_request(request_id, &head, peer, scheme);
     let script_request_fallback = script_request.clone();
     let script_outcome = monoio::select! {
-        x = shared.script_runtime.run_request(script_request) => x,
-        _ = interrupt => return,
+        x = script_runtime.run_request(shared.site.load_full(), script_request) => x,
+        _ = interrupt => {
+          async_log(format!("[handle] {}: interrupted\n", request_id).into_bytes()).await;
+          return false;
+        }
     };
     let script_outcome = match script_outcome {
         Ok(outcome) => outcome,
@@ -247,18 +290,27 @@ async fn handle_request(
     }
 
     if let Some(proxy_url) = script_outcome.reverse_proxy {
-        if let Err(err) = reverse_proxy_request(&proxy_url, head, body, w, head_only).await {
+        if let Err(err) = reverse_proxy_request(
+            &proxy_url,
+            head,
+            body,
+            w,
+            head_only,
+            &script_outcome.metadata,
+        )
+        .await
+        {
             async_log(format!("[handle] {}: reverse proxy: {:?}\n", request_id, err).into_bytes())
                 .await;
-            send_fixed(w, bad_gateway()).await;
+            send_fixed(w, bad_gateway(), &script_outcome.metadata).await;
         }
-        return;
+        return true;
     }
 
     if let Some(response) = script_outcome.response {
         drain_payload(body).await;
-        send_script_response(w, response, head_only).await;
-        return;
+        send_script_response(w, response, head_only, &script_outcome.metadata).await;
+        return true;
     }
 
     drain_payload(body).await;
@@ -269,14 +321,21 @@ async fn handle_request(
                 .await
                 .is_none()
             {
-                send_fixed(w, not_found()).await
+                send_fixed(w, not_found(), &script_outcome.metadata).await
             }
         }
-        _ => send_fixed(w, method_not_allowed()).await,
+        _ => send_fixed(w, method_not_allowed(), &script_outcome.metadata).await,
     }
+
+    true
 }
 
-async fn send_fixed(w: &mut impl AsyncWriteRent, res: Response<Bytes>) {
+async fn send_fixed(
+    w: &mut impl AsyncWriteRent,
+    mut res: Response<Bytes>,
+    metadata: &HashMap<String, String>,
+) {
+    apply_metadata_response_headers(res.headers_mut(), metadata);
     let _ = GenericEncoder::new(w)
         .send_and_flush(res.map(|x| Payload::Fixed(FixedPayload::<_, HttpError>::new(x))))
         .await;
@@ -315,7 +374,7 @@ async fn serve_static(
                     Ok(text) => apply_template(text, metadata).into_bytes(),
                     Err(_) => body,
                 };
-                send_bytes_response(w, StatusCode::OK, mime, rendered, head_only).await;
+                send_bytes_response(w, StatusCode::OK, mime, rendered, head_only, metadata).await;
             }
             Err(err) => {
                 eprintln!("failed to render {}: {:?}", entry.path, err);
@@ -325,6 +384,7 @@ async fn serve_static(
                     "text/plain; charset=utf-8",
                     b"Internal Server Error".to_vec(),
                     head_only,
+                    metadata,
                 )
                 .await;
             }
@@ -332,18 +392,13 @@ async fn serve_static(
         return Some(());
     }
 
-    let header = format!(
-        "HTTP/1.1 200 OK\r
-content-length: {}\r
-server: {}\r
-accept-ranges: bytes\r
-content-type: {}\r\n\r\n",
-        entry.size,
-        crate::SERVER_HEADER,
-        mime,
+    let mut headers = build_base_headers(entry.size, mime);
+    headers.insert(
+        http::header::ACCEPT_RANGES,
+        http::HeaderValue::from_static("bytes"),
     );
-
-    let _ = w.write_all(header.into_bytes()).await;
+    apply_metadata_response_headers(&mut headers, metadata);
+    let _ = write_response_head(w, StatusCode::OK, &headers).await;
 
     if head_only {
         let _ = w.flush().await;
@@ -414,15 +469,6 @@ async fn stream_tar_entry(
     Ok(())
 }
 
-async fn read_tar_entry(entry: Arc<TarEntry>, site: &Arc<Site>) -> std::io::Result<Vec<u8>> {
-    let file = site.tar_file.try_clone().and_then(File::from_std)?;
-    let size = usize::try_from(entry.size)
-        .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidData))?;
-    let (res, buf) = file.read_exact_at(vec![0u8; size], entry.offset).await;
-    res?;
-    Ok(buf)
-}
-
 fn should_template_replace(content_type: &str, metadata: &HashMap<String, String>) -> bool {
     !metadata.is_empty()
         && (content_type == "text/html"
@@ -457,26 +503,56 @@ fn apply_template(body: &str, metadata: &HashMap<String, String>) -> String {
     out
 }
 
+const RESPONSE_HEADER_PREFIX: &str = "zs.response.header.";
+
+fn build_base_headers(content_length: u64, content_type: &str) -> http::HeaderMap {
+    let mut headers = http::HeaderMap::new();
+    let length = HeaderValue::from_str(&content_length.to_string())
+        .unwrap_or_else(|_| HeaderValue::from_static("0"));
+    headers.insert(http::header::CONTENT_LENGTH, length);
+    headers.insert(
+        http::header::SERVER,
+        HeaderValue::from_static(crate::SERVER_HEADER),
+    );
+    let content_type = HeaderValue::from_str(content_type)
+        .unwrap_or_else(|_| HeaderValue::from_static("application/octet-stream"));
+    headers.insert(http::header::CONTENT_TYPE, content_type);
+    headers
+}
+
+fn apply_metadata_response_headers(
+    headers: &mut http::HeaderMap,
+    metadata: &HashMap<String, String>,
+) {
+    for (key, value) in metadata {
+        let Some(header_name) = key.strip_prefix(RESPONSE_HEADER_PREFIX) else {
+            continue;
+        };
+        let header_name = header_name.trim();
+        if header_name.is_empty() {
+            continue;
+        }
+        let Ok(header_name) = HeaderName::from_bytes(header_name.as_bytes()) else {
+            continue;
+        };
+        let Ok(header_value) = HeaderValue::from_str(value) else {
+            continue;
+        };
+        headers.insert(header_name, header_value);
+    }
+}
+
 async fn send_bytes_response(
     w: &mut impl AsyncWriteRent,
     status: StatusCode,
     content_type: &str,
     body: Vec<u8>,
     head_only: bool,
+    metadata: &HashMap<String, String>,
 ) {
-    let reason = status.canonical_reason().unwrap_or("");
-    let header = format!(
-        "HTTP/1.1 {} {}\r
-content-length: {}\r
-server: {}\r
-content-type: {}\r\n\r\n",
-        status.as_u16(),
-        reason,
-        body.len(),
-        crate::SERVER_HEADER,
-        content_type
-    );
-    let _ = w.write_all(header.into_bytes()).await;
+    let mut headers = build_base_headers(body.len() as u64, content_type);
+    apply_metadata_response_headers(&mut headers, metadata);
+    let _ = write_response_head(w, status, &headers).await;
     if !head_only {
         let _ = w.write_all(body).await;
     }
@@ -557,12 +633,18 @@ async fn send_script_response(
     w: &mut impl AsyncWriteRent,
     response: ScriptResponse,
     head_only: bool,
+    metadata: &HashMap<String, String>,
 ) {
     let status = StatusCode::from_u16(response.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-    let content_type = response
-        .content_type
-        .unwrap_or_else(|| "text/plain; charset=utf-8".to_string());
-    send_bytes_response(w, status, &content_type, response.body, head_only).await;
+    send_bytes_response(
+        w,
+        status,
+        "text/plain; charset=utf-8",
+        response.body,
+        head_only,
+        metadata,
+    )
+    .await;
 }
 
 async fn reverse_proxy_request(
@@ -571,6 +653,7 @@ async fn reverse_proxy_request(
     body: HttpBody,
     w: &mut impl AsyncWriteRent,
     head_only: bool,
+    metadata: &HashMap<String, String>,
 ) -> Result<()> {
     let target = match parse_backend_target(backend_url) {
         Ok(target) => target,
@@ -620,8 +703,12 @@ async fn reverse_proxy_request(
     };
 
     let reuse = match &mut conn {
-        PooledConnection::Http(codec) => proxy_over_codec(codec, head, body, w, head_only).await?,
-        PooledConnection::Https(codec) => proxy_over_codec(codec, head, body, w, head_only).await?,
+        PooledConnection::Http(codec) => {
+            proxy_over_codec(codec, head, body, w, head_only, metadata).await?
+        }
+        PooledConnection::Https(codec) => {
+            proxy_over_codec(codec, head, body, w, head_only, metadata).await?
+        }
     };
 
     if reuse {
@@ -633,9 +720,6 @@ async fn reverse_proxy_request(
 
 async fn connect_backend(target: &BackendTarget) -> Result<PooledConnection> {
     thread_local! {
-        static DNS_TP: ThreadPool = rayon::ThreadPoolBuilder::new()
-            .thread_name(|i| format!("dns-tp-{}", i))
-            .num_threads(4).build().unwrap();
         static DNS_CACHE: RefCell<mini_moka::unsync::Cache<String, Arc<Vec<SocketAddr>>>> =
             RefCell::new(mini_moka::unsync::CacheBuilder::new(128)
                 .time_to_live(Duration::from_secs(60))
@@ -700,6 +784,7 @@ async fn proxy_over_codec<IO>(
     body: HttpBody,
     w: &mut impl AsyncWriteRent,
     head_only: bool,
+    metadata: &HashMap<String, String>,
 ) -> Result<bool>
 where
     IO: AsyncReadRent + AsyncWriteRent,
@@ -725,7 +810,8 @@ where
     let body_hint = resp_body.hint();
     let send_body = should_send_proxy_body(status, body_hint, head_only);
     apply_proxy_response_headers(&mut headers, body_hint, send_body);
-    write_proxy_response_head(w, status, &headers).await?;
+    apply_metadata_response_headers(&mut headers, metadata);
+    write_response_head(w, status, &headers).await?;
 
     if !send_body {
         drain_proxy_payload(codec, &mut resp_body).await?;
@@ -802,7 +888,7 @@ fn apply_proxy_response_headers(
     }
 }
 
-async fn write_proxy_response_head(
+async fn write_response_head(
     w: &mut impl AsyncWriteRent,
     status: StatusCode,
     headers: &http::HeaderMap,
@@ -1111,8 +1197,45 @@ const MAX_PROXY_LINE_LEN: usize = 108;
 async fn read_proxy_protocol_peer(
     stream: &mut TcpStream,
     fallback: std::net::SocketAddr,
+    config: &StaticConfig,
 ) -> Result<std::net::SocketAddr> {
-    let mut line = Vec::with_capacity(MAX_PROXY_LINE_LEN);
+    let mut line: Vec<u8> = Vec::with_capacity(MAX_PROXY_LINE_LEN);
+
+    if !config.debug_proxy_protocol_disable_fast_path {
+        stream.readable(false).await?;
+
+        // fast path: peek socket buffer
+        unsafe {
+            let n = libc::recv(
+                stream.as_raw_fd(),
+                line.as_mut_ptr().cast(),
+                line.capacity(),
+                libc::MSG_PEEK,
+            );
+            if n > 0 {
+                let n = n as usize;
+                assert!(n <= line.capacity());
+                line.set_len(n);
+            }
+        }
+        if !line.is_empty() {
+            let len = line
+                .windows(2)
+                .enumerate()
+                .find(|x| x.1 == b"\r\n")
+                .map(|x| x.0);
+            if let Some(len) = len {
+                let output = parse_proxy_protocol_v1(&line[..len], fallback);
+                // consume the buffer
+                let (res, _) = stream.read_exact(SliceMut::new(line, 0, len + 2)).await;
+                res?;
+                return output;
+            }
+        }
+
+        line.clear();
+    }
+
     let mut buffer = Box::new([0u8; 1]);
     while line.len() < MAX_PROXY_LINE_LEN {
         let (res, buf) = stream.read_exact(buffer).await;
@@ -1122,8 +1245,7 @@ async fn read_proxy_protocol_peer(
         line.push(byte);
         let len = line.len();
         if len >= 2 && line[len - 2] == b'\r' && line[len - 1] == b'\n' {
-            let header = std::str::from_utf8(&line).context("PROXY header must be valid ASCII")?;
-            return parse_proxy_protocol_v1(header, fallback);
+            return parse_proxy_protocol_v1(&line, fallback);
         }
     }
     Err(anyhow!(
@@ -1132,9 +1254,10 @@ async fn read_proxy_protocol_peer(
 }
 
 fn parse_proxy_protocol_v1(
-    header: &str,
+    header: &[u8],
     fallback: std::net::SocketAddr,
 ) -> Result<std::net::SocketAddr> {
+    let header = std::str::from_utf8(header).context("PROXY header must be valid ASCII")?;
     let header = header.trim_end_matches("\r\n");
     let mut parts = header.split_whitespace();
     let prefix = parts

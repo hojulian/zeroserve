@@ -80,6 +80,13 @@ impl Site {
         })
     }
 
+    fn get_entry_safe<'a>(&'a self, key: &str) -> Option<&'a Arc<TarEntry>> {
+        if key.starts_with(".zeroserve/") {
+            return None;
+        }
+        self.entries.get(key)
+    }
+
     pub fn lookup(
         &self,
         path: &NormalizedPath,
@@ -87,29 +94,29 @@ impl Site {
         try_html: bool,
     ) -> Option<Arc<TarEntry>> {
         let rel = path.relative();
-        if let Some(entry) = self.entries.get(rel) {
+        if let Some(entry) = self.get_entry_safe(rel) {
             return Some(entry.clone());
         }
 
         if path.dir_hint() || rel.is_empty() || self.directories.contains(rel) {
             let index_key = path.append_index(default_index);
-            if let Some(entry) = self.entries.get(&index_key) {
+            if let Some(entry) = self.get_entry_safe(&index_key) {
                 return Some(entry.clone());
             }
         }
 
         if !rel.is_empty() {
             let fallback = format!("{}/{}", rel, default_index);
-            if let Some(entry) = self.entries.get(&fallback) {
+            if let Some(entry) = self.get_entry_safe(&fallback) {
                 return Some(entry.clone());
             }
-        } else if let Some(entry) = self.entries.get(default_index) {
+        } else if let Some(entry) = self.get_entry_safe(default_index) {
             return Some(entry.clone());
         }
 
         if try_html && !rel.is_empty() && !rel.ends_with(".html") {
             let html_candidate = format!("{rel}.html");
-            if let Some(entry) = self.entries.get(&html_candidate) {
+            if let Some(entry) = self.get_entry_safe(&html_candidate) {
                 return Some(entry.clone());
             }
         }

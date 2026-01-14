@@ -1,5 +1,7 @@
 mod cli;
 mod config;
+mod hupwatch;
+mod json;
 mod logging;
 mod pack;
 mod pool;
@@ -8,11 +10,13 @@ mod script;
 mod server;
 mod shared;
 mod site;
+mod thread_pool;
 mod tls;
 
-use std::io::Write;
 use std::net::TcpListener;
+use std::rc::Rc;
 use std::sync::Arc;
+use std::{collections::HashSet, io::Write};
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -140,6 +144,7 @@ fn main() -> Result<()> {
                     preempt_timer_interval: config.preempt_timer_interval,
                 })
             };
+            let script_runtime = Rc::new(script_runtime);
             eprintln!(
                 "async preemption timer interval: {:?}",
                 config.preempt_timer_interval
@@ -156,11 +161,10 @@ fn main() -> Result<()> {
                 tls_runtime,
                 http_listener,
                 tls_listener,
-                script_runtime,
             ));
-            start_reload_thread(shared.clone())?;
+            start_reload_thread(shared.clone(), script_runtime.clone())?;
 
-            amain(shared).await
+            amain(shared, script_runtime).await
         })
 }
 
@@ -169,36 +173,41 @@ fn setup_landlock(config: &StaticConfig) -> anyhow::Result<()> {
     let access_read = AccessFs::ReadFile;
     let access_all = AccessFs::from_all(abi);
 
-    let mut ruleset = Ruleset::default()
-        .handle_access(access_all)?
-        .create()?
-        .add_rule(PathBeneath::new(
-            PathFd::new(&config.tar_path).with_context(|| "failed to open tar_path")?,
-            access_read,
-        ))?;
+    let mut ruleset = Ruleset::default().handle_access(access_all)?.create()?;
     if let Ok(x) = PathFd::new("/etc/resolv.conf") {
         ruleset = ruleset.add_rule(PathBeneath::new(x, access_read))?;
     }
 
+    let mut ro_paths = HashSet::new();
+
+    if let Some(x) = config.tar_path.parent() {
+        ro_paths.insert(x);
+    }
+
     if let Some(x) = &config.cert_path {
-        ruleset = ruleset.add_rule(PathBeneath::new(
-            PathFd::new(x).with_context(|| "failed to open cert_path")?,
-            access_read,
-        ))?;
+        if let Some(x) = x.parent() {
+            ro_paths.insert(x);
+        }
     }
 
     if let Some(x) = &config.key_path {
-        ruleset = ruleset.add_rule(PathBeneath::new(
-            PathFd::new(x).with_context(|| "failed to open key_path")?,
-            access_read,
-        ))?;
+        if let Some(x) = x.parent() {
+            ro_paths.insert(x);
+        }
     }
 
     if let Some(x) = &config.reload_signal_file {
+        if let Some(x) = x.parent() {
+            ro_paths.insert(x);
+        }
+    }
+
+    for x in ro_paths {
         ruleset = ruleset.add_rule(PathBeneath::new(
-            PathFd::new(x).with_context(|| "failed to open reload_signal_file")?,
+            PathFd::new(x)
+                .with_context(|| format!("failed to open for landlock: {}", x.display()))?,
             access_read,
-        ))?;
+        ))?
     }
     ruleset.restrict_self()?;
     Ok(())

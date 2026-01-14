@@ -44,8 +44,8 @@ zs_u64 entry(void) {
     char *bp = zs_stpcpy(body, "{\"status\":\"ok\",\"year\":\"");
     bp += zs_utoa10(year_from_unix_ms_fast(zs_now_ms()), bp, 16);
     bp = zs_stpcpy(bp, "\"}\n");
-    const char ctype[] = "application/json";
-    zs_respond(200, body, bp - body, ctype, sizeof(ctype) - 1);
+    zs_meta_set(ZS_STR("zs.response.header.content-type"), ZS_STR("application/json"));
+    zs_respond(200, body, bp - body);
   }
 
   return 0;

@@ -20,6 +20,7 @@ pub struct StaticConfig {
     pub enable_netns_isolation: bool,
     pub preempt_timer_interval: Duration,
     pub sqpoll_idle_ms: Option<u32>,
+    pub debug_proxy_protocol_disable_fast_path: bool,
 }
 
 impl TryFrom<Cli> for StaticConfig {
@@ -71,6 +72,7 @@ impl TryFrom<Cli> for StaticConfig {
             preempt_timer_interval: Duration::from_millis(cli.preempt_timer_interval_ms as u64),
             sqpoll_idle_ms: cli.sqpoll_idle_ms,
             enable_netns_isolation: cli.enable_netns_isolation,
+            debug_proxy_protocol_disable_fast_path: cli.debug_proxy_protocol_disable_fast_path,
         })
     }
 }

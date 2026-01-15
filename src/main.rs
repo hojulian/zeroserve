@@ -96,9 +96,9 @@ fn main() -> Result<()> {
 
         drop_all_capabilities().with_context(|| "failed to drop capabilities")?;
 
-        rlimit::Resource::NPROC
-            .set(1024, 1024)
-            .with_context(|| "failed to restrict nproc")?;
+        if let Err(err) = rlimit::Resource::NPROC.set(1024, 1024) {
+            eprintln!("failed to restrict nproc: {:?}", err);
+        }
 
         eprintln!(
             "isolation: ns_user=y, ns_net={}, ns_mount=y; caps, nproc",

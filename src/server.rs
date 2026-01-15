@@ -36,7 +36,9 @@ use monoio_http::{
         BorrowFramedRead,
         codec::{
             ClientCodec,
-            decoder::{ChunkedBodyDecoder, FixedBodyDecoder, PayloadDecoder, RequestDecoder},
+            decoder::{
+                ChunkedBodyDecoder, FillPayload, FixedBodyDecoder, PayloadDecoder, RequestDecoder,
+            },
             encoder::GenericEncoder,
         },
         payload::{FixedPayload, Payload},
@@ -111,7 +113,14 @@ async fn run_http_listener(
             if let Err(err) =
                 handle_connection(hup, stream, peer, state, Scheme::Http, script_runtime).await
             {
-                eprintln!("connection {} over http closed with error: {err:?}", peer);
+                async_log(
+                    format!(
+                        "[listener] connection {} over http closed with error: {err:?}",
+                        peer
+                    )
+                    .into_bytes(),
+                )
+                .await;
             }
         });
     }
@@ -175,7 +184,14 @@ async fn run_tls_listener(
                     )
                     .await
                     {
-                        eprintln!("TLS conn {reported_peer} closed with error: {err:?}");
+                        async_log(
+                            format!(
+                                "[listener] connection {} over tls closed with error: {err:?}",
+                                reported_peer
+                            )
+                            .into_bytes(),
+                        )
+                        .await;
                     }
                 }
                 Err(err) => log_tls_error(reported_peer, err),
@@ -209,16 +225,22 @@ where
     while let Some(result) = decoder.next().await {
         match result {
             Ok(request) => {
-                let can_continue = handle_request(
-                    request,
-                    &shared,
-                    &script_runtime,
-                    peer,
-                    scheme,
-                    &mut w,
-                    &mut hup,
-                )
-                .await;
+                let filler = async {
+                    decoder.fill_payload().await?;
+                    Ok::<_, anyhow::Error>(futures::future::pending::<bool>().await)
+                };
+                let can_continue = monoio::select! {
+                    x = handle_request(
+                        request,
+                        &shared,
+                        &script_runtime,
+                        peer,
+                        scheme,
+                        &mut w,
+                        &mut hup,
+                    ) => x,
+                    x = filler => x?,
+                };
                 if !can_continue {
                     break;
                 }
@@ -264,7 +286,7 @@ async fn handle_request(
     let script_request_fallback = script_request.clone();
     let script_outcome = monoio::select! {
         x = script_runtime.run_request(shared.site.load_full(), script_request) => x,
-        _ = interrupt => {
+        _ = &mut *interrupt => {
           async_log(format!("[handle] {}: interrupted\n", request_id).into_bytes()).await;
           return false;
         }
@@ -290,19 +312,21 @@ async fn handle_request(
     }
 
     if let Some(proxy_url) = script_outcome.reverse_proxy {
-        if let Err(err) = reverse_proxy_request(
-            &proxy_url,
-            head,
-            body,
-            w,
-            head_only,
-            &script_outcome.metadata,
-        )
-        .await
-        {
+        let res = monoio::select! {
+            x = reverse_proxy_request(
+                &proxy_url,
+                head,
+                body,
+                w,
+                head_only,
+                &script_outcome.metadata,
+            ) => x,
+            _ = &mut *interrupt => Err(anyhow::anyhow!("interrupted")),
+        };
+        if let Err(err) = res {
             async_log(format!("[handle] {}: reverse proxy: {:?}\n", request_id, err).into_bytes())
                 .await;
-            send_fixed(w, bad_gateway(), &script_outcome.metadata).await;
+            return false;
         }
         return true;
     }

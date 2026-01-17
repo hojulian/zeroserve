@@ -5,44 +5,24 @@ use std::{
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs},
     os::fd::AsRawFd,
     rc::Rc,
-    sync::{Arc, Weak},
+    sync::Arc,
     time::Duration,
 };
 
-use anyhow::{Context, Result, anyhow};
-use bytes::Bytes;
-use futures::channel::oneshot;
-use http::{
+use ::http::{
     Method, StatusCode, Uri,
     header::{HeaderName, HeaderValue},
 };
+use anyhow::{Context, Result, anyhow};
+use bytes::Bytes;
+use futures::channel::oneshot;
 use monoio::{
     buf::SliceMut,
-    fs::File,
     io::{
-        AsyncReadRent, AsyncReadRentExt, AsyncWriteRent, AsyncWriteRentExt, Split, Splitable,
-        sink::SinkExt, stream::Stream,
+        AsyncReadRent, AsyncReadRentExt, AsyncWriteRent, AsyncWriteRentExt, BufReader, BufWriter,
+        Split, Splitable,
     },
     net::{TcpListener, TcpStream},
-};
-use monoio_http::{
-    common::{
-        body::{Body, StreamHint},
-        error::HttpError,
-        request::{Request, RequestHead},
-        response::Response,
-    },
-    h1::{
-        BorrowFramedRead,
-        codec::{
-            ClientCodec,
-            decoder::{
-                ChunkedBodyDecoder, FillPayload, FixedBodyDecoder, PayloadDecoder, RequestDecoder,
-            },
-            encoder::GenericEncoder,
-        },
-        payload::{FixedPayload, Payload},
-    },
 };
 use monoio_rustls::{ClientTlsStream, TlsConnector, TlsError};
 use rustls::{ClientConfig, RootCertStore, pki_types::ServerName};
@@ -51,15 +31,16 @@ use url::Url;
 
 use crate::{
     config::StaticConfig,
+    http::h1::{self, HttpError, Request, RequestHead, StreamHint},
     logging::async_log,
     pool::{self, PoolKey, PooledConnection},
     script::{ScriptOutcome, ScriptRequest, ScriptResponse, ScriptRuntime},
-    shared::{SharedState, read_tar_entry},
-    site::{Site, TarEntry, guess_mime, normalize_request_path},
+    shared::{SharedState, read_tar_entry, stream_tar_entry},
+    site::{guess_mime, normalize_request_path},
     thread_pool::DNS_TP,
 };
 
-type HttpBody = Payload<Bytes, HttpError>;
+type HttpBody = h1::Body;
 
 pub async fn amain(shared: Arc<SharedState>, script_runtime: Rc<ScriptRuntime>) -> Result<()> {
     if shared.config.tls_addr.is_some() {
@@ -220,53 +201,51 @@ async fn handle_connection<IO>(
 where
     IO: AsyncReadRent + AsyncWriteRent + Split + 'static,
 {
-    let (r, mut w) = io.into_split();
-    let mut decoder = RequestDecoder::new(r);
-    while let Some(result) = decoder.next().await {
-        match result {
-            Ok(request) => {
-                let filler = async {
-                    decoder.fill_payload().await?;
-                    Ok::<_, anyhow::Error>(futures::future::pending::<bool>().await)
-                };
-                let can_continue = monoio::select! {
-                    x = handle_request(
-                        request,
-                        &shared,
-                        &script_runtime,
-                        peer,
-                        scheme,
-                        &mut w,
-                        &mut hup,
-                    ) => x,
-                    x = filler => x?,
-                };
-                if !can_continue {
+    let (r, w) = io.into_split();
+    let r = BufReader::new(r);
+    let mut w = BufWriter::new(w);
+    let mut reader = h1::H1Connection::new(r);
+    loop {
+        let result = reader.next_request().await;
+        let request = match result {
+            Ok(Some(request)) => request,
+            Ok(None) => break,
+            Err(err) => {
+                if matches!(err, HttpError::Io(ref x) if x.kind() == ErrorKind::ConnectionReset
+                    || x.kind() == ErrorKind::UnexpectedEof)
+                    || matches!(err, HttpError::UnexpectedEof)
+                {
                     break;
                 }
-            }
-            Err(err) => {
-                if let HttpError::IOError(x) = &err {
-                    if x.kind() == ErrorKind::ConnectionReset
-                        || x.kind() == ErrorKind::UnexpectedEof
-                    {
-                        break;
-                    }
-                }
-
                 eprintln!(
                     "{} request from {peer} could not be parsed: {err}",
                     scheme.as_str()
                 );
                 break;
             }
+        };
+
+        let can_continue = handle_request(
+            request,
+            &mut reader,
+            &shared,
+            &script_runtime,
+            peer,
+            scheme,
+            &mut w,
+            &mut hup,
+        )
+        .await;
+        if !can_continue {
+            break;
         }
     }
     Ok(())
 }
 
-async fn handle_request(
+async fn handle_request<R: AsyncReadRent>(
     req: Request,
+    reader: &mut h1::H1Connection<R>,
     shared: &Arc<SharedState>,
     script_runtime: &Rc<ScriptRuntime>,
     peer: std::net::SocketAddr,
@@ -275,11 +254,10 @@ async fn handle_request(
     interrupt: &mut (impl Future<Output = ()> + Unpin),
 ) -> bool {
     let request_id = Ulid::new();
+    let (mut head, mut body) = req.into_parts();
     if !shared.config.disable_request_logging {
-        log_request(request_id, peer, scheme, req.method(), req.uri()).await;
+        log_request(request_id, peer, scheme, &head.method, &head.uri).await;
     }
-
-    let (mut head, body) = req.into_parts();
     let head_only = head.method == Method::HEAD;
 
     let script_request = build_script_request(request_id, &head, peer, scheme);
@@ -317,27 +295,32 @@ async fn handle_request(
                 &proxy_url,
                 head,
                 body,
+                reader,
                 w,
                 head_only,
                 &script_outcome.metadata,
             ) => x,
             _ = &mut *interrupt => Err(anyhow::anyhow!("interrupted")),
         };
-        if let Err(err) = res {
-            async_log(format!("[handle] {}: reverse proxy: {:?}\n", request_id, err).into_bytes())
+        match res {
+            Ok(continue_conn) => return continue_conn,
+            Err(err) => {
+                async_log(
+                    format!("[handle] {}: reverse proxy: {:?}\n", request_id, err).into_bytes(),
+                )
                 .await;
-            return false;
+                return false;
+            }
         }
-        return true;
     }
 
     if let Some(response) = script_outcome.response {
-        drain_payload(body).await;
+        drain_payload(reader, &mut body).await;
         send_script_response(w, response, head_only, &script_outcome.metadata).await;
         return true;
     }
 
-    drain_payload(body).await;
+    drain_payload(reader, &mut body).await;
 
     match head.method {
         Method::GET | Method::HEAD => {
@@ -356,21 +339,31 @@ async fn handle_request(
 
 async fn send_fixed(
     w: &mut impl AsyncWriteRent,
-    mut res: Response<Bytes>,
+    mut res: ::http::Response<Bytes>,
     metadata: &HashMap<String, String>,
 ) {
+    if !res.headers().contains_key(::http::header::CONTENT_LENGTH)
+        && !res
+            .headers()
+            .contains_key(::http::header::TRANSFER_ENCODING)
+    {
+        let length = ::http::HeaderValue::from_str(&res.body().len().to_string())
+            .unwrap_or_else(|_| ::http::HeaderValue::from_static("0"));
+        res.headers_mut()
+            .insert(::http::header::CONTENT_LENGTH, length);
+    }
     apply_metadata_response_headers(res.headers_mut(), metadata);
-    let _ = GenericEncoder::new(w)
-        .send_and_flush(res.map(|x| Payload::Fixed(FixedPayload::<_, HttpError>::new(x))))
-        .await;
+    let (parts, body) = res.into_parts();
+    let _ = write_response_head(w, parts.status, &parts.headers).await;
+    if !body.is_empty() {
+        let _ = w.write_all(body.to_vec()).await;
+    }
+    let _ = w.flush().await;
 }
 
-async fn drain_payload<B>(mut payload: B)
-where
-    B: Body<Data = Bytes, Error = HttpError>,
-{
+async fn drain_payload<R: AsyncReadRent>(reader: &mut h1::H1Connection<R>, body: &mut h1::Body) {
     loop {
-        match payload.next_data().await {
+        match body.next_data(reader).await {
             Some(Ok(_)) => continue,
             Some(Err(_)) => continue,
             None => break,
@@ -422,10 +415,10 @@ async fn serve_static(
     }
 
     let mut headers = build_base_headers(entry.size, mime);
-    headers.insert(http::header::ETAG, etag_header_value(&entry.etag));
+    headers.insert(::http::header::ETAG, etag_header_value(&entry.etag));
     headers.insert(
-        http::header::ACCEPT_RANGES,
-        http::HeaderValue::from_static("bytes"),
+        ::http::header::ACCEPT_RANGES,
+        ::http::HeaderValue::from_static("bytes"),
     );
     apply_metadata_response_headers(&mut headers, metadata);
     let _ = write_response_head(w, StatusCode::OK, &headers).await;
@@ -447,56 +440,6 @@ async fn serve_static(
         }
     };
     Some(())
-}
-
-async fn stream_tar_entry(
-    entry: Arc<TarEntry>,
-    site: &Arc<Site>,
-    chunk_size: usize,
-    w: &mut impl AsyncWriteRent,
-) -> std::io::Result<()> {
-    thread_local! {
-        static TAR_FILE_CACHE: RefCell<Vec<(Weak<Site>, Rc<File>)>> = RefCell::new(Vec::new());
-    }
-
-    let file = TAR_FILE_CACHE.with(|x| {
-        let mut x = x.borrow_mut();
-        x.retain(|x| x.0.strong_count() != 0);
-        let site_weak = Arc::downgrade(site);
-        if let Some(x) = x.iter().find(|x| x.0.ptr_eq(&site_weak)) {
-            return Ok(x.1.clone());
-        }
-        let file = match site.tar_file.try_clone() {
-            Ok(x) => Rc::new(File::from_std(x).unwrap()),
-            Err(e) => {
-                eprintln!("failed to create tar handle: {}", e);
-                return Err(e);
-            }
-        };
-        x.push((Arc::downgrade(&site), file.clone()));
-        Ok(file)
-    })?;
-
-    let mut remaining = entry.size;
-    let mut offset = entry.offset;
-    let mut buffer = vec![0u8; chunk_size];
-    while remaining > 0 {
-        let read_len = remaining.min(chunk_size as u64) as usize;
-        let view = monoio::buf::SliceMut::new(buffer, 0, read_len);
-        let (res, view) = file.read_at(view, offset).await;
-        buffer = view.into_inner();
-        let n = res?;
-        if n == 0 {
-            return Err(std::io::Error::from(std::io::ErrorKind::InvalidData));
-        }
-        let view = monoio::buf::Slice::new(buffer, 0, n);
-        let (res, view) = w.write_all(view).await;
-        buffer = view.into_inner();
-        res?;
-        remaining -= n as u64;
-        offset += n as u64;
-    }
-    Ok(())
 }
 
 fn should_template_replace(content_type: &str, metadata: &HashMap<String, String>) -> bool {
@@ -535,23 +478,23 @@ fn apply_template(body: &str, metadata: &HashMap<String, String>) -> String {
 
 const RESPONSE_HEADER_PREFIX: &str = "zs.response.header.";
 
-fn build_base_headers(content_length: u64, content_type: &str) -> http::HeaderMap {
-    let mut headers = http::HeaderMap::new();
+fn build_base_headers(content_length: u64, content_type: &str) -> ::http::HeaderMap {
+    let mut headers = ::http::HeaderMap::new();
     let length = HeaderValue::from_str(&content_length.to_string())
         .unwrap_or_else(|_| HeaderValue::from_static("0"));
-    headers.insert(http::header::CONTENT_LENGTH, length);
+    headers.insert(::http::header::CONTENT_LENGTH, length);
     headers.insert(
-        http::header::SERVER,
+        ::http::header::SERVER,
         HeaderValue::from_static(crate::SERVER_HEADER),
     );
     let content_type = HeaderValue::from_str(content_type)
         .unwrap_or_else(|_| HeaderValue::from_static("application/octet-stream"));
-    headers.insert(http::header::CONTENT_TYPE, content_type);
+    headers.insert(::http::header::CONTENT_TYPE, content_type);
     headers
 }
 
 fn apply_metadata_response_headers(
-    headers: &mut http::HeaderMap,
+    headers: &mut ::http::HeaderMap,
     metadata: &HashMap<String, String>,
 ) {
     for (key, value) in metadata {
@@ -572,8 +515,8 @@ fn apply_metadata_response_headers(
     }
 }
 
-fn if_none_match_matches(headers: &http::HeaderMap, etag: &str) -> bool {
-    let value = match headers.get(http::header::IF_NONE_MATCH) {
+fn if_none_match_matches(headers: &::http::HeaderMap, etag: &str) -> bool {
+    let value = match headers.get(::http::header::IF_NONE_MATCH) {
         Some(value) => value,
         None => return false,
     };
@@ -628,13 +571,16 @@ async fn send_not_modified(
     etag: &str,
     metadata: &HashMap<String, String>,
 ) {
-    let mut headers = http::HeaderMap::new();
+    let mut headers = ::http::HeaderMap::new();
     headers.insert(
-        http::header::SERVER,
+        ::http::header::SERVER,
         HeaderValue::from_static(crate::SERVER_HEADER),
     );
-    headers.insert(http::header::ETAG, etag_header_value(etag));
-    headers.insert(http::header::CONTENT_LENGTH, HeaderValue::from_static("0"));
+    headers.insert(::http::header::ETAG, etag_header_value(etag));
+    headers.insert(
+        ::http::header::CONTENT_LENGTH,
+        HeaderValue::from_static("0"),
+    );
     apply_metadata_response_headers(&mut headers, metadata);
     let _ = write_response_head(w, StatusCode::NOT_MODIFIED, &headers).await;
     let _ = w.flush().await;
@@ -731,41 +677,45 @@ async fn send_script_response(
 async fn reverse_proxy_request(
     backend_url: &str,
     mut head: RequestHead,
-    body: HttpBody,
+    mut body: HttpBody,
+    reader: &mut h1::H1Connection<impl AsyncReadRent>,
     w: &mut impl AsyncWriteRent,
     head_only: bool,
     metadata: &HashMap<String, String>,
-) -> Result<()> {
+) -> Result<bool> {
     let target = match parse_backend_target(backend_url) {
         Ok(target) => target,
         Err(err) => {
-            drain_payload(body).await;
+            drain_payload(reader, &mut body).await;
             return Err(err);
         }
     };
     let uri = match build_backend_uri(&target, &head.uri) {
         Ok(uri) => uri,
         Err(err) => {
-            drain_payload(body).await;
+            drain_payload(reader, &mut body).await;
             return Err(err);
         }
     };
 
+    let is_ws_request = h1::is_websocket_upgrade_request(&head);
+
     let mut headers = head.headers;
-    strip_hop_headers(&mut headers);
+    strip_hop_headers(&mut headers, is_ws_request);
+    apply_proxy_request_headers(&mut headers, &body);
     let host_header = target.host_header();
-    let host_header_value = match http::HeaderValue::from_str(&host_header) {
+    let host_header_value = match ::http::HeaderValue::from_str(&host_header) {
         Ok(value) => value,
         Err(_) => {
-            drain_payload(body).await;
+            drain_payload(reader, &mut body).await;
             return Err(anyhow!("invalid backend host header"));
         }
     };
-    headers.insert(http::header::HOST, host_header_value);
+    headers.insert(::http::header::HOST, host_header_value);
 
     head.uri = uri;
     head.headers = headers;
-    head.version = http::Version::HTTP_11;
+    head.version = ::http::Version::HTTP_11;
 
     let pool_key = PoolKey::new(
         target.host.clone(),
@@ -777,26 +727,46 @@ async fn reverse_proxy_request(
         None => match connect_backend(&target).await {
             Ok(conn) => conn,
             Err(err) => {
-                drain_payload(body).await;
+                drain_payload(reader, &mut body).await;
                 return Err(err);
             }
         },
     };
 
-    let reuse = match &mut conn {
+    let outcome = match &mut conn {
         PooledConnection::Http(codec) => {
-            proxy_over_codec(codec, head, body, w, head_only, metadata).await?
+            proxy_over_connection(
+                codec,
+                head,
+                body,
+                reader,
+                w,
+                head_only,
+                metadata,
+                is_ws_request,
+            )
+            .await?
         }
         PooledConnection::Https(codec) => {
-            proxy_over_codec(codec, head, body, w, head_only, metadata).await?
+            proxy_over_connection(
+                codec,
+                head,
+                body,
+                reader,
+                w,
+                head_only,
+                metadata,
+                is_ws_request,
+            )
+            .await?
         }
     };
 
-    if reuse {
+    if outcome.reuse_backend {
         pool::return_connection(pool_key, conn);
     }
 
-    Ok(())
+    Ok(outcome.keep_client)
 }
 
 async fn connect_backend(target: &BackendTarget) -> Result<PooledConnection> {
@@ -837,10 +807,10 @@ async fn connect_backend(target: &BackendTarget) -> Result<PooledConnection> {
     };
 
     match target.scheme {
-        BackendScheme::Http => Ok(PooledConnection::Http(ClientCodec::new(stream))),
+        BackendScheme::Http => Ok(PooledConnection::Http(h1::H1Connection::new(stream))),
         BackendScheme::Https => {
             let tls_stream = connect_tls(stream, &target.host).await?;
-            Ok(PooledConnection::Https(ClientCodec::new(tls_stream)))
+            Ok(PooledConnection::Https(h1::H1Connection::new(tls_stream)))
         }
     }
 }
@@ -859,67 +829,103 @@ async fn connect_tls(stream: TcpStream, host: &str) -> Result<ClientTlsStream<Tc
         .map_err(|err| anyhow!("TLS handshake failed: {err}"))
 }
 
-async fn proxy_over_codec<IO>(
-    codec: &mut ClientCodec<IO>,
+struct ProxyOutcome {
+    reuse_backend: bool,
+    keep_client: bool,
+}
+
+async fn proxy_over_connection<IO, R>(
+    conn: &mut h1::H1Connection<IO>,
     head: RequestHead,
-    body: HttpBody,
+    mut body: HttpBody,
+    reader: &mut h1::H1Connection<R>,
     w: &mut impl AsyncWriteRent,
     head_only: bool,
     metadata: &HashMap<String, String>,
-) -> Result<bool>
+    is_ws_request: bool,
+) -> Result<ProxyOutcome>
 where
-    IO: AsyncReadRent + AsyncWriteRent,
+    IO: AsyncReadRent + AsyncWriteRent + Split,
+    R: AsyncReadRent,
 {
-    let request = Request::from_parts(head, body);
-    codec
-        .send_and_flush(request)
+    h1::write_request_head(conn.io_mut()?, &head)
         .await
-        .map_err(|err| anyhow!("failed to send proxy request: {err}"))?;
+        .map_err(|err| anyhow!("failed to send proxy request head: {err}"))?;
+    forward_request_body(conn, reader, &mut body)
+        .await
+        .map_err(|err| anyhow!("failed to send proxy request body: {err}"))?;
 
-    let response = match codec.next().await {
-        Some(Ok(resp)) => resp,
-        Some(Err(err)) => return Err(anyhow!("failed to read proxy response: {err}")),
-        None => return Err(anyhow!("proxy backend closed without response")),
+    let response = match conn.next_response().await {
+        Ok(Some(resp)) => resp,
+        Ok(None) => return Err(anyhow!("proxy backend closed without response")),
+        Err(err) => return Err(anyhow!("failed to read proxy response: {err}")),
     };
 
     let (resp_head, mut resp_body) = response.into_parts();
     let status = resp_head.status;
-    let can_reuse = should_reuse_proxy_connection(resp_head.version, &resp_head.headers);
+    let mut can_reuse = should_reuse_proxy_connection(resp_head.version, &resp_head.headers);
+    let is_ws_response = is_ws_request && h1::is_websocket_upgrade_response(&resp_head);
     let mut headers = resp_head.headers;
-    strip_hop_headers(&mut headers);
-
+    if is_ws_response {
+        strip_hop_headers(&mut headers, true);
+    } else {
+        strip_hop_headers(&mut headers, false);
+    }
     let body_hint = resp_body.hint();
+    if resp_body.is_eof() {
+        can_reuse = false;
+    }
+
+    if is_ws_response {
+        apply_metadata_response_headers(&mut headers, metadata);
+        write_response_head(w, status, &headers).await?;
+        let _ = w.flush().await;
+
+        let (backend_io, backend_leftover) = conn
+            .take_io()
+            .ok_or_else(|| anyhow!("proxy backend missing io"))?;
+        let (client_io, client_leftover) = reader
+            .take_io()
+            .ok_or_else(|| anyhow!("client missing io for websocket"))?;
+        tunnel_websocket(client_io, w, backend_io, client_leftover, backend_leftover).await?;
+        return Ok(ProxyOutcome {
+            reuse_backend: false,
+            keep_client: false,
+        });
+    }
+
     let send_body = should_send_proxy_body(status, body_hint, head_only);
     apply_proxy_response_headers(&mut headers, body_hint, send_body);
     apply_metadata_response_headers(&mut headers, metadata);
     write_response_head(w, status, &headers).await?;
 
     if !send_body {
-        drain_proxy_payload(codec, &mut resp_body).await?;
+        drain_proxy_payload(conn, &mut resp_body).await?;
         let _ = w.flush().await;
-        return Ok(can_reuse);
+        return Ok(ProxyOutcome {
+            reuse_backend: can_reuse,
+            keep_client: true,
+        });
     }
 
-    match &mut resp_body {
-        PayloadDecoder::None => {}
-        PayloadDecoder::Fixed(decoder) => forward_fixed_body(w, codec, decoder).await?,
-        PayloadDecoder::Streamed(decoder) => forward_chunked_body(w, codec, decoder).await?,
-    }
-
+    forward_proxy_body(w, conn, &mut resp_body).await?;
     let _ = w.flush().await;
-    Ok(can_reuse)
+    Ok(ProxyOutcome {
+        reuse_backend: can_reuse,
+        keep_client: true,
+    })
 }
 
-fn should_reuse_proxy_connection(version: http::Version, headers: &http::HeaderMap) -> bool {
-    if version != http::Version::HTTP_11 {
+fn should_reuse_proxy_connection(version: ::http::Version, headers: &::http::HeaderMap) -> bool {
+    if version != ::http::Version::HTTP_11 {
         return false;
     }
     !connection_has_close(headers)
 }
 
-fn connection_has_close(headers: &http::HeaderMap) -> bool {
+fn connection_has_close(headers: &::http::HeaderMap) -> bool {
     headers
-        .get(http::header::CONNECTION)
+        .get(::http::header::CONNECTION)
         .and_then(|value| value.to_str().ok())
         .map(|value| {
             value
@@ -942,37 +948,49 @@ fn should_send_proxy_body(status: StatusCode, body_hint: StreamHint, head_only: 
 }
 
 fn apply_proxy_response_headers(
-    headers: &mut http::HeaderMap,
+    headers: &mut ::http::HeaderMap,
     body_hint: StreamHint,
     send_body: bool,
 ) {
     if !send_body {
-        headers.remove(http::header::TRANSFER_ENCODING);
+        headers.remove(::http::header::TRANSFER_ENCODING);
         return;
     }
 
     match body_hint {
         StreamHint::None => {
-            headers.remove(http::header::CONTENT_LENGTH);
-            headers.remove(http::header::TRANSFER_ENCODING);
+            headers.remove(::http::header::CONTENT_LENGTH);
+            headers.remove(::http::header::TRANSFER_ENCODING);
         }
         StreamHint::Fixed => {
-            headers.remove(http::header::TRANSFER_ENCODING);
+            headers.remove(::http::header::TRANSFER_ENCODING);
         }
         StreamHint::Stream => {
-            headers.remove(http::header::CONTENT_LENGTH);
+            headers.remove(::http::header::CONTENT_LENGTH);
             headers.insert(
-                http::header::TRANSFER_ENCODING,
-                http::HeaderValue::from_static("chunked"),
+                ::http::header::TRANSFER_ENCODING,
+                ::http::HeaderValue::from_static("chunked"),
             );
         }
+    }
+}
+
+fn apply_proxy_request_headers(headers: &mut ::http::HeaderMap, body: &h1::Body) {
+    if body.is_chunked() {
+        headers.remove(::http::header::CONTENT_LENGTH);
+        headers.insert(
+            ::http::header::TRANSFER_ENCODING,
+            ::http::HeaderValue::from_static("chunked"),
+        );
+    } else {
+        headers.remove(::http::header::TRANSFER_ENCODING);
     }
 }
 
 async fn write_response_head(
     w: &mut impl AsyncWriteRent,
     status: StatusCode,
-    headers: &http::HeaderMap,
+    headers: &::http::HeaderMap,
 ) -> Result<()> {
     let reason = status.canonical_reason().unwrap_or("");
     let mut buf = Vec::new();
@@ -989,100 +1007,161 @@ async fn write_response_head(
     Ok(())
 }
 
-async fn drain_proxy_payload<IO>(
-    codec: &mut ClientCodec<IO>,
-    body: &mut PayloadDecoder<FixedBodyDecoder, ChunkedBodyDecoder>,
+async fn forward_request_body<IO, R>(
+    conn: &mut h1::H1Connection<IO>,
+    reader: &mut h1::H1Connection<R>,
+    body: &mut h1::Body,
 ) -> Result<()>
 where
-    IO: AsyncReadRent + AsyncWriteRent,
+    IO: AsyncWriteRent,
+    R: AsyncReadRent,
 {
-    match body {
-        PayloadDecoder::None => Ok(()),
-        PayloadDecoder::Fixed(decoder) => {
-            read_fixed_chunk(codec, decoder).await?;
+    match body.hint() {
+        StreamHint::None => return Ok(()),
+        StreamHint::Stream if body.is_eof() => {
+            return Err(anyhow!("proxy request body missing length"));
+        }
+        _ => {}
+    }
+
+    if body.is_chunked() {
+        while let Some(chunk) = body.next_data(reader).await {
+            let chunk = chunk.map_err(|err| anyhow!("proxy request body read failed: {err}"))?;
+            h1::write_chunk(conn.io_mut()?, chunk.as_ref())
+                .await
+                .map_err(|err| anyhow!("failed to write proxy body chunk: {err}"))?;
+        }
+        h1::write_chunk_end(conn.io_mut()?)
+            .await
+            .map_err(|err| anyhow!("failed to write proxy body end: {err}"))?;
+    } else {
+        while let Some(chunk) = body.next_data(reader).await {
+            let chunk = chunk.map_err(|err| anyhow!("proxy request body read failed: {err}"))?;
+            let (res, _) = conn.io_mut()?.write_all(chunk.to_vec()).await;
+            res.map_err(|err| anyhow!("failed to write proxy body: {err}"))?;
+        }
+    }
+    let _ = conn.io_mut()?.flush().await;
+    Ok(())
+}
+
+async fn drain_proxy_payload<IO>(conn: &mut h1::H1Connection<IO>, body: &mut h1::Body) -> Result<()>
+where
+    IO: AsyncReadRent,
+{
+    while let Some(chunk) = body.next_data(conn).await {
+        chunk.map_err(|err| anyhow!("proxy body read failed: {err}"))?;
+    }
+    Ok(())
+}
+
+async fn forward_proxy_body<IO>(
+    w: &mut impl AsyncWriteRent,
+    conn: &mut h1::H1Connection<IO>,
+    body: &mut h1::Body,
+) -> Result<()>
+where
+    IO: AsyncReadRent,
+{
+    match body.hint() {
+        StreamHint::None => Ok(()),
+        StreamHint::Fixed => {
+            while let Some(chunk) = body.next_data(conn).await {
+                let chunk = chunk.map_err(|err| anyhow!("proxy body read failed: {err}"))?;
+                let (res, _) = w.write_all(chunk.to_vec()).await;
+                res.map_err(|err| anyhow!("failed to write proxy body: {err}"))?;
+            }
             Ok(())
         }
-        PayloadDecoder::Streamed(decoder) => loop {
-            match codec.framed_mut().next_with(decoder).await {
-                None => return Err(anyhow!("proxy body read failed: unexpected eof")),
-                Some(Ok(Some(_))) => continue,
-                Some(Ok(None)) => return Ok(()),
-                Some(Err(err)) => return Err(anyhow!("proxy body read failed: {err}")),
+        StreamHint::Stream => {
+            while let Some(chunk) = body.next_data(conn).await {
+                let chunk = chunk.map_err(|err| anyhow!("proxy body read failed: {err}"))?;
+                h1::write_chunk(w, chunk.as_ref())
+                    .await
+                    .map_err(|err| anyhow!("failed to write proxy body chunk: {err}"))?;
             }
-        },
-    }
-}
-
-async fn read_fixed_chunk<IO>(
-    codec: &mut ClientCodec<IO>,
-    decoder: &mut FixedBodyDecoder,
-) -> Result<Bytes>
-where
-    IO: AsyncReadRent + AsyncWriteRent,
-{
-    match codec.framed_mut().next_with(decoder).await {
-        None => Err(anyhow!("proxy body read failed: unexpected eof")),
-        Some(Ok(chunk)) => Ok(chunk),
-        Some(Err(err)) => Err(anyhow!("proxy body read failed: {err}")),
-    }
-}
-
-async fn forward_fixed_body<IO>(
-    w: &mut impl AsyncWriteRent,
-    codec: &mut ClientCodec<IO>,
-    decoder: &mut FixedBodyDecoder,
-) -> Result<()>
-where
-    IO: AsyncReadRent + AsyncWriteRent,
-{
-    let data = read_fixed_chunk(codec, decoder).await?;
-    let (res, _) = w.write_all(data).await;
-    res.map_err(|err| anyhow!("failed to write proxy body: {err}"))?;
-    Ok(())
-}
-
-async fn forward_chunked_body<IO>(
-    w: &mut impl AsyncWriteRent,
-    codec: &mut ClientCodec<IO>,
-    decoder: &mut ChunkedBodyDecoder,
-) -> Result<()>
-where
-    IO: AsyncReadRent + AsyncWriteRent,
-{
-    loop {
-        match codec.framed_mut().next_with(decoder).await {
-            None => return Err(anyhow!("proxy body read failed: unexpected eof")),
-            Some(Ok(Some(data))) => {
-                if data.is_empty() {
-                    continue;
-                }
-                let header = format!("{:X}\r\n", data.len());
-                let (res, _) = w.write_all(header.into_bytes()).await;
-                res.map_err(|err| anyhow!("failed to write proxy body header: {err}"))?;
-                let (res, _) = w.write_all(data).await;
-                res.map_err(|err| anyhow!("failed to write proxy body: {err}"))?;
-                let (res, _) = w.write_all(b"\r\n".to_vec()).await;
-                res.map_err(|err| anyhow!("failed to write proxy body trailer: {err}"))?;
-            }
-            Some(Ok(None)) => break,
-            Some(Err(err)) => return Err(anyhow!("proxy body read failed: {err}")),
+            h1::write_chunk_end(w)
+                .await
+                .map_err(|err| anyhow!("failed to write proxy body end: {err}"))?;
+            Ok(())
         }
     }
-    let (res, _) = w.write_all(b"0\r\n\r\n".to_vec()).await;
-    res.map_err(|err| anyhow!("failed to write proxy body end: {err}"))?;
+}
+
+async fn tunnel_websocket<R, IO>(
+    client_read: R,
+    client_write: impl AsyncWriteRent,
+    backend_io: IO,
+    client_leftover: Vec<u8>,
+    backend_leftover: Vec<u8>,
+) -> Result<()>
+where
+    R: AsyncReadRent,
+    IO: AsyncReadRent + AsyncWriteRent + Split,
+{
+    let (backend_read, backend_write) = backend_io.into_split();
+    let client_to_backend = copy_stream(client_read, backend_write, client_leftover);
+    let backend_to_client = copy_stream(backend_read, client_write, backend_leftover);
+    let (res_a, res_b) = futures::future::join(client_to_backend, backend_to_client).await;
+    res_a?;
+    res_b?;
     Ok(())
 }
 
-fn strip_hop_headers(headers: &mut http::HeaderMap) {
+async fn copy_stream<R, W>(mut reader: R, mut writer: W, pending: Vec<u8>) -> Result<()>
+where
+    R: AsyncReadRent,
+    W: AsyncWriteRent,
+{
+    if !pending.is_empty() {
+        let (res, _) = writer.write_all(pending).await;
+        res.map_err(|err| anyhow!("failed to write websocket buffer: {err}"))?;
+    }
+
+    let mut buf = vec![0u8; 8 * 1024];
+    loop {
+        let (res, next_buf) = futures::future::join(reader.read(buf), writer.flush())
+            .await
+            .0;
+        buf = next_buf;
+        let n = res.map_err(|err| anyhow!("websocket read failed: {err}"))?;
+        if n == 0 {
+            let _ = writer.shutdown().await;
+            return Ok(());
+        }
+        let view = monoio::buf::Slice::new(buf, 0, n);
+        let (res, view) = writer.write_all(view).await;
+        buf = view.into_inner();
+        res.map_err(|err| anyhow!("websocket write failed: {err}"))?;
+    }
+}
+
+fn strip_hop_headers(headers: &mut ::http::HeaderMap, keep_upgrade: bool) {
     let connection_values = headers
-        .get(http::header::CONNECTION)
+        .get(::http::header::CONNECTION)
         .and_then(|value| value.to_str().ok())
         .map(|value| value.to_string());
     if let Some(value) = connection_values {
+        let mut saw_upgrade = false;
         for name in value.split(',').map(|name| name.trim()) {
-            if !name.is_empty() {
-                let name = name.to_ascii_lowercase();
-                headers.remove(name.as_str());
+            if name.is_empty() {
+                continue;
+            }
+            if keep_upgrade && name.eq_ignore_ascii_case("upgrade") {
+                saw_upgrade = true;
+                continue;
+            }
+            let name = name.to_ascii_lowercase();
+            headers.remove(name.as_str());
+        }
+        if keep_upgrade {
+            if saw_upgrade {
+                headers.insert(
+                    ::http::header::CONNECTION,
+                    ::http::HeaderValue::from_static("upgrade"),
+                );
+            } else {
+                headers.remove(::http::header::CONNECTION);
             }
         }
     }
@@ -1096,6 +1175,9 @@ fn strip_hop_headers(headers: &mut http::HeaderMap) {
         "transfer-encoding",
         "upgrade",
     ] {
+        if keep_upgrade && (name == "connection" || name == "upgrade") {
+            continue;
+        }
         headers.remove(name);
     }
 }
@@ -1216,19 +1298,19 @@ fn format_host_port(host: &str, port: u16, is_ipv6: bool) -> String {
     }
 }
 
-fn not_found() -> Response<Bytes> {
+fn not_found() -> ::http::Response<Bytes> {
     text_response(StatusCode::NOT_FOUND, "Not Found")
 }
 
-fn method_not_allowed() -> Response<Bytes> {
+fn method_not_allowed() -> ::http::Response<Bytes> {
     text_response(StatusCode::METHOD_NOT_ALLOWED, "Method Not Allowed")
 }
 
-fn text_response(status: StatusCode, body: &str) -> Response<Bytes> {
-    http::Response::builder()
+fn text_response(status: StatusCode, body: &str) -> ::http::Response<Bytes> {
+    ::http::Response::builder()
         .status(status)
-        .header(http::header::SERVER, crate::SERVER_HEADER)
-        .header(http::header::CONTENT_TYPE, "text/plain; charset=utf-8")
+        .header(::http::header::SERVER, crate::SERVER_HEADER)
+        .header(::http::header::CONTENT_TYPE, "text/plain; charset=utf-8")
         .body(Bytes::copy_from_slice(body.as_bytes()))
         .unwrap()
 }

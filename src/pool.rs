@@ -5,8 +5,9 @@ use std::{
 };
 
 use monoio::net::TcpStream;
-use monoio_http::h1::codec::ClientCodec;
 use monoio_rustls::ClientTlsStream;
+
+use crate::http::h1::H1Connection;
 
 const MAX_POOL_PER_KEY: usize = 128;
 const MAX_IDLE: Duration = Duration::from_secs(30);
@@ -29,8 +30,8 @@ impl PoolKey {
 }
 
 pub enum PooledConnection {
-    Http(ClientCodec<TcpStream>),
-    Https(ClientCodec<ClientTlsStream<TcpStream>>),
+    Http(H1Connection<TcpStream>),
+    Https(H1Connection<ClientTlsStream<TcpStream>>),
 }
 
 struct PoolEntry {

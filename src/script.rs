@@ -8,6 +8,10 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+use ::http::{
+    Uri,
+    header::{HeaderName, HeaderValue},
+};
 use anyhow::Context;
 use async_ebpf::{
     helpers::{Helper, write_cstr},
@@ -19,10 +23,6 @@ use async_ebpf::{
 use base64ct::{Base64, Base64Unpadded, Base64Url, Base64UrlUnpadded, Encoding};
 use futures::{FutureExt, channel::oneshot};
 use hmac::{Hmac, Mac};
-use http::{
-    Uri,
-    header::{HeaderName, HeaderValue},
-};
 use monoio::fs::File;
 use rand::RngCore;
 use sha2::Sha256;

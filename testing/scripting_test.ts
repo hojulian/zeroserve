@@ -9,6 +9,8 @@ import {
 
 const canRunScripts = await hasBpfToolchain();
 const encoder = new TextEncoder();
+const decoder = new TextDecoder();
+type ByteArray = Uint8Array<ArrayBufferLike>;
 
 function bytesToBase64(bytes: Uint8Array): string {
     let binary = "";
@@ -27,7 +29,7 @@ function bytesToBase64Url(bytes: Uint8Array): string {
 }
 
 async function startBackend(
-    handler: (req: Request) => Response,
+    handler: (req: Request) => Response | Promise<Response>,
 ): Promise<{ url: string; close: () => Promise<void> }> {
     const controller = new AbortController();
     let port = 0;
@@ -60,6 +62,385 @@ async function startBackend(
             await server.finished;
         },
     };
+}
+
+async function startWebsocketBackend(): Promise<{
+    httpUrl: string;
+    close: () => Promise<void>;
+}> {
+    const controller = new AbortController();
+    let port = 0;
+    const sockets = new Set<WebSocket>();
+    const server = Deno.serve(
+        {
+            hostname: "127.0.0.1",
+            port: 0,
+            signal: controller.signal,
+            onListen: ({ port: listenPort }) => {
+                port = listenPort;
+            },
+        },
+        (req) => {
+            const upgrade = req.headers.get("upgrade") ?? "";
+            if (!upgrade.toLowerCase().includes("websocket")) {
+                return new Response("upgrade required", { status: 426 });
+            }
+            const { socket, response } = Deno.upgradeWebSocket(req);
+            sockets.add(socket);
+            socket.addEventListener("message", (event) => {
+                socket.send(`echo:${event.data}`);
+            });
+            socket.addEventListener("close", () => {
+                sockets.delete(socket);
+            });
+            return response;
+        },
+    );
+
+    if (port === 0) {
+        await new Promise((resolve) => setTimeout(resolve, 0));
+    }
+
+    if (port === 0) {
+        controller.abort();
+        await server.finished;
+        throw new Error("failed to start websocket backend");
+    }
+
+    return {
+        httpUrl: `http://127.0.0.1:${port}`,
+        close: async () => {
+            const pending = Array.from(sockets, (socket) =>
+                new Promise<void>((resolve) => {
+                    if (socket.readyState === WebSocket.CLOSED) {
+                        resolve();
+                        return;
+                    }
+                    socket.addEventListener("close", () => resolve(), {
+                        once: true,
+                    });
+                    try {
+                        socket.close();
+                    } catch {
+                        resolve();
+                    }
+                })
+            );
+            await Promise.all(pending);
+            controller.abort();
+            await server.finished;
+        },
+    };
+}
+
+async function assertWebsocketEcho(url: string, payload: string): Promise<void> {
+    await new Promise<void>((resolve, reject) => {
+        const ws = new WebSocket(url);
+        let done = false;
+        let timer: number | null = null;
+        const closePromise = new Promise<void>((resolveClose) => {
+            ws.onclose = () => resolveClose();
+        });
+        const finish = (err?: Error) => {
+            if (done) {
+                return;
+            }
+            done = true;
+            if (timer !== null) {
+                clearTimeout(timer);
+            }
+            if (err) {
+                reject(err);
+            } else {
+                resolve();
+            }
+        };
+        const terminate = (err: Error) => {
+            try {
+                ws.close();
+            } catch {
+                // ignore close errors on error path
+            }
+            closePromise.then(() => finish(err));
+        };
+        timer = setTimeout(() => {
+            terminate(new Error("websocket timeout"));
+        }, 2000);
+
+        ws.onopen = () => {
+            ws.send(payload);
+        };
+
+        ws.onmessage = (event) => {
+            if (event.data === `echo:${payload}`) {
+                try {
+                    ws.close();
+                } catch {
+                    // ignore close errors on shutdown path
+                }
+                closePromise.then(() => finish());
+            }
+        };
+
+        ws.onerror = () => {
+            terminate(new Error("websocket error"));
+        };
+    });
+}
+
+type RawHttpResponse = {
+    status: number;
+    headers: Headers;
+    body: ByteArray;
+};
+
+async function writeAll(conn: Deno.Conn, data: Uint8Array): Promise<void> {
+    let offset = 0;
+    while (offset < data.length) {
+        offset += await conn.write(data.subarray(offset));
+    }
+}
+
+function concatBuffers(chunks: ByteArray[], total: number): ByteArray {
+    const out = new Uint8Array(total);
+    let offset = 0;
+    for (const chunk of chunks) {
+        out.set(chunk, offset);
+        offset += chunk.length;
+    }
+    return out;
+}
+
+function appendBuffer(buffer: ByteArray, chunk: ByteArray): ByteArray {
+    if (buffer.length === 0) {
+        return chunk;
+    }
+    const out = new Uint8Array(buffer.length + chunk.length);
+    out.set(buffer);
+    out.set(chunk, buffer.length);
+    return out;
+}
+
+function indexOfSequence(buffer: ByteArray, needle: ByteArray): number {
+    if (needle.length === 0 || buffer.length < needle.length) {
+        return -1;
+    }
+    outer:
+    for (let i = 0; i <= buffer.length - needle.length; i++) {
+        for (let j = 0; j < needle.length; j++) {
+            if (buffer[i + j] !== needle[j]) {
+                continue outer;
+            }
+        }
+        return i;
+    }
+    return -1;
+}
+
+async function readUntil(
+    conn: Deno.Conn,
+    delimiter: ByteArray,
+): Promise<{ head: ByteArray; rest: ByteArray }> {
+    let buffer: ByteArray = new Uint8Array();
+    while (true) {
+        const index = indexOfSequence(buffer, delimiter);
+        if (index >= 0) {
+            const head = buffer.subarray(0, index);
+            const rest = buffer.subarray(index + delimiter.length);
+            return { head, rest };
+        }
+        const chunk: ByteArray = new Uint8Array(8192);
+        const n = await conn.read(chunk);
+        if (n === null || n === 0) {
+            throw new Error("unexpected eof while reading headers");
+        }
+        buffer = appendBuffer(buffer, chunk.subarray(0, n));
+    }
+}
+
+async function readChunkedBody(
+    conn: Deno.Conn,
+    initial: ByteArray,
+): Promise<ByteArray> {
+    const crlf = encoder.encode("\r\n");
+    let buffer = initial;
+    const chunks: ByteArray[] = [];
+    let total = 0;
+
+    const readMore = async () => {
+        const chunk: ByteArray = new Uint8Array(8192);
+        const n = await conn.read(chunk);
+        if (n === null || n === 0) {
+            throw new Error("unexpected eof while reading chunked body");
+        }
+        buffer = appendBuffer(buffer, chunk.subarray(0, n));
+    };
+
+    while (true) {
+        let lineEnd = indexOfSequence(buffer, crlf);
+        while (lineEnd === -1) {
+            await readMore();
+            lineEnd = indexOfSequence(buffer, crlf);
+        }
+        const line = decoder.decode(buffer.subarray(0, lineEnd));
+        buffer = buffer.subarray(lineEnd + crlf.length);
+        const sizePart = line.split(";")[0].trim();
+        const size = Number.parseInt(sizePart, 16);
+        if (!Number.isFinite(size)) {
+            throw new Error(`invalid chunk size: ${line}`);
+        }
+        if (size === 0) {
+            while (true) {
+                let trailerEnd = indexOfSequence(buffer, crlf);
+                while (trailerEnd === -1) {
+                    await readMore();
+                    trailerEnd = indexOfSequence(buffer, crlf);
+                }
+                const trailer = decoder.decode(buffer.subarray(0, trailerEnd));
+                buffer = buffer.subarray(trailerEnd + crlf.length);
+                if (trailer.length === 0) {
+                    return concatBuffers(chunks, total);
+                }
+            }
+        }
+        while (buffer.length < size + crlf.length) {
+            await readMore();
+        }
+        const chunk = buffer.subarray(0, size);
+        const trailer = buffer.subarray(size, size + crlf.length);
+        if (
+            trailer.length !== crlf.length ||
+            indexOfSequence(trailer, crlf) !== 0
+        ) {
+            throw new Error("missing chunk trailer");
+        }
+        chunks.push(chunk);
+        total += chunk.length;
+        buffer = buffer.subarray(size + crlf.length);
+    }
+}
+
+async function readContentLengthBody(
+    conn: Deno.Conn,
+    initial: ByteArray,
+    length: number,
+): Promise<ByteArray> {
+    let buffer = initial;
+    while (buffer.length < length) {
+        const chunk: ByteArray = new Uint8Array(8192);
+        const n = await conn.read(chunk);
+        if (n === null || n === 0) {
+            throw new Error("unexpected eof while reading body");
+        }
+        buffer = appendBuffer(buffer, chunk.subarray(0, n));
+    }
+    return buffer.subarray(0, length);
+}
+
+async function readToEnd(conn: Deno.Conn, initial: ByteArray): Promise<ByteArray> {
+    const chunks: ByteArray[] = [];
+    let total = 0;
+    if (initial.length > 0) {
+        chunks.push(initial);
+        total += initial.length;
+    }
+    while (true) {
+        const chunk: ByteArray = new Uint8Array(8192);
+        const n = await conn.read(chunk);
+        if (n === null || n === 0) {
+            break;
+        }
+        const slice = chunk.subarray(0, n);
+        chunks.push(slice);
+        total += slice.length;
+    }
+    return concatBuffers(chunks, total);
+}
+
+async function sendRawHttpRequest(
+    hostname: string,
+    port: number,
+    path: string,
+    body: string,
+    chunked: boolean,
+): Promise<RawHttpResponse> {
+    const conn = await Deno.connect({ hostname, port });
+    try {
+        const bodyBytes = encoder.encode(body);
+        const headers = [
+            `Host: ${hostname}:${port}`,
+            "User-Agent: deno-test",
+            "Accept: */*",
+            "Content-Type: text/plain",
+        ];
+        if (chunked) {
+            headers.push("Transfer-Encoding: chunked");
+        } else {
+            headers.push(`Content-Length: ${bodyBytes.length}`);
+        }
+        const headerText = `POST ${path} HTTP/1.1\r\n${headers.join("\r\n")}\r\n\r\n`;
+        await writeAll(conn, encoder.encode(headerText));
+        if (chunked) {
+            const mid = Math.max(1, Math.floor(body.length / 2));
+            const parts = [body.slice(0, mid), body.slice(mid)];
+            for (const part of parts) {
+                if (part.length === 0) {
+                    continue;
+                }
+                const chunk = encoder.encode(part);
+                const prefix = `${chunk.length.toString(16)}\r\n`;
+                await writeAll(conn, encoder.encode(prefix));
+                await writeAll(conn, chunk);
+                await writeAll(conn, encoder.encode("\r\n"));
+            }
+            await writeAll(conn, encoder.encode("0\r\n\r\n"));
+        } else if (bodyBytes.length > 0) {
+            await writeAll(conn, bodyBytes);
+        }
+
+        const delimiter = encoder.encode("\r\n\r\n");
+        const { head, rest } = await readUntil(conn, delimiter);
+        const headerTextResp = decoder.decode(head);
+        const lines = headerTextResp.split("\r\n").filter((line) => line.length > 0);
+        if (lines.length === 0) {
+            throw new Error("missing response status line");
+        }
+        const [_, statusCode] = lines[0].split(" ");
+        const status = Number.parseInt(statusCode ?? "", 10);
+        if (!Number.isFinite(status)) {
+            throw new Error(`invalid response status: ${lines[0]}`);
+        }
+        const headersOut = new Headers();
+        for (const line of lines.slice(1)) {
+            const idx = line.indexOf(":");
+            if (idx === -1) {
+                continue;
+            }
+            const name = line.slice(0, idx).trim();
+            const value = line.slice(idx + 1).trim();
+            headersOut.append(name, value);
+        }
+
+        const transferEncoding = headersOut.get("transfer-encoding");
+        const contentLength = headersOut.get("content-length");
+        let bodyBytesOut: Uint8Array;
+        if (transferEncoding && transferEncoding.toLowerCase().includes("chunked")) {
+            bodyBytesOut = await readChunkedBody(conn, rest);
+        } else if (contentLength) {
+            const length = Number.parseInt(contentLength, 10);
+            bodyBytesOut = await readContentLengthBody(conn, rest, length);
+        } else {
+            bodyBytesOut = await readToEnd(conn, rest);
+        }
+
+        return {
+            status,
+            headers: headersOut,
+            body: bodyBytesOut,
+        };
+    } finally {
+        conn.close();
+    }
 }
 
 Deno.test({
@@ -110,6 +491,225 @@ Deno.test({
                 assert(!templatedBody.includes("<zs-meta>now_ms</zs-meta>"));
             });
         } finally {
+            if (tarPath) {
+                await Deno.remove(tarPath).catch(() => {});
+            }
+            await Deno.remove(siteDir, { recursive: true }).catch(() => {});
+        }
+    },
+});
+
+Deno.test({
+    name: "e2e: websocket reverse proxy",
+    ignore: !canRunScripts,
+    fn: async () => {
+        const backend = await startWebsocketBackend();
+        const siteDir = await Deno.makeTempDir();
+        let tarPath: string | null = null;
+        try {
+            await Deno.writeTextFile(
+                join(siteDir, "index.html"),
+                "websocket proxy\n",
+            );
+
+            const scriptsDir = join(siteDir, ".zeroserve", "scripts");
+            await Deno.mkdir(scriptsDir, { recursive: true });
+
+            const scriptSource = `#include <zeroserve.h>
+
+ZS_ENTRY
+zs_u64 entry(void) {
+  char path[32];
+  zs_req_path(path, sizeof(path));
+  if (zs_strcmp(path, "/socket") == 0) {
+    zs_reverse_proxy(ZS_STR("${backend.httpUrl}"));
+  }
+  return 0;
+}
+`;
+            await Deno.writeTextFile(
+                join(scriptsDir, "15-ws-proxy.c"),
+                scriptSource,
+            );
+
+            tarPath = await packSite(siteDir);
+
+            await withZeroserve(tarPath, async (baseUrl) => {
+                const wsUrl = `${baseUrl.replace("http://", "ws://")}/socket`;
+                await assertWebsocketEcho(wsUrl, "ping");
+            });
+        } finally {
+            await backend.close().catch(() => {});
+            if (tarPath) {
+                await Deno.remove(tarPath).catch(() => {});
+            }
+            await Deno.remove(siteDir, { recursive: true }).catch(() => {});
+        }
+    },
+});
+
+Deno.test({
+    name: "e2e: reverse proxy chunked and fixed bodies",
+    ignore: !canRunScripts,
+    fn: async () => {
+        const backend = await startBackend(async (req) => {
+            const url = new URL(req.url);
+            const body = await req.text();
+            const payload = JSON.stringify({
+                body,
+                contentLength: req.headers.get("content-length"),
+                transferEncoding: req.headers.get("transfer-encoding"),
+            });
+
+            if (url.pathname === "/chunked") {
+                const stream = new ReadableStream<Uint8Array>({
+                    start(controller) {
+                        const bytes = encoder.encode(payload);
+                        const mid = Math.max(1, Math.floor(bytes.length / 2));
+                        controller.enqueue(bytes.subarray(0, mid));
+                        controller.enqueue(bytes.subarray(mid));
+                        controller.close();
+                    },
+                });
+                return new Response(stream, {
+                    headers: { "content-type": "application/json" },
+                });
+            }
+
+            return new Response(payload, {
+                headers: { "content-type": "application/json" },
+            });
+        });
+
+        const siteDir = await Deno.makeTempDir();
+        let tarPath: string | null = null;
+        try {
+            const scriptsDir = join(siteDir, ".zeroserve", "scripts");
+            await Deno.mkdir(scriptsDir, { recursive: true });
+
+            const scriptSource = `#include <zeroserve.h>
+
+ZS_ENTRY
+zs_u64 entry(void) {
+  zs_reverse_proxy(ZS_STR("${backend.url}"));
+  return 0;
+}
+`;
+            await Deno.writeTextFile(
+                join(scriptsDir, "20-proxy-bodies.c"),
+                scriptSource,
+            );
+
+            tarPath = await packSite(siteDir);
+
+            await withZeroserve(tarPath, async (baseUrl) => {
+                const url = new URL(baseUrl);
+                const hostname = url.hostname;
+                const port = Number(url.port);
+
+                const fixedFixed = await sendRawHttpRequest(
+                    hostname,
+                    port,
+                    "/fixed",
+                    "fixed-body",
+                    false,
+                );
+                assertEquals(fixedFixed.status, 200);
+                const fixedFixedPayload = JSON.parse(
+                    decoder.decode(fixedFixed.body),
+                ) as {
+                    body: string;
+                    contentLength: string | null;
+                    transferEncoding: string | null;
+                };
+                assertEquals(fixedFixedPayload.body, "fixed-body");
+                assertEquals(fixedFixedPayload.transferEncoding, null);
+                assertEquals(fixedFixedPayload.contentLength, "10");
+                assertEquals(
+                    fixedFixed.headers.get("transfer-encoding"),
+                    null,
+                );
+                assert(fixedFixed.headers.get("content-length") !== null);
+
+                const chunkedFixed = await sendRawHttpRequest(
+                    hostname,
+                    port,
+                    "/fixed",
+                    "chunked-body",
+                    true,
+                );
+                const chunkedFixedPayload = JSON.parse(
+                    decoder.decode(chunkedFixed.body),
+                ) as {
+                    body: string;
+                    contentLength: string | null;
+                    transferEncoding: string | null;
+                };
+                assertEquals(chunkedFixedPayload.body, "chunked-body");
+                assertEquals(chunkedFixedPayload.contentLength, null);
+                assert(
+                    chunkedFixedPayload.transferEncoding?.toLowerCase().includes(
+                        "chunked",
+                    ),
+                );
+                assertEquals(
+                    chunkedFixed.headers.get("transfer-encoding"),
+                    null,
+                );
+                assert(chunkedFixed.headers.get("content-length") !== null);
+
+                const fixedChunked = await sendRawHttpRequest(
+                    hostname,
+                    port,
+                    "/chunked",
+                    "fixed-to-chunked",
+                    false,
+                );
+                const fixedChunkedPayload = JSON.parse(
+                    decoder.decode(fixedChunked.body),
+                ) as {
+                    body: string;
+                    contentLength: string | null;
+                    transferEncoding: string | null;
+                };
+                assertEquals(fixedChunkedPayload.body, "fixed-to-chunked");
+                assertEquals(fixedChunkedPayload.transferEncoding, null);
+                assertEquals(fixedChunkedPayload.contentLength, "16");
+                assert(
+                    fixedChunked.headers.get("transfer-encoding")?.toLowerCase()
+                        .includes("chunked"),
+                );
+                assertEquals(fixedChunked.headers.get("content-length"), null);
+
+                const chunkedChunked = await sendRawHttpRequest(
+                    hostname,
+                    port,
+                    "/chunked",
+                    "chunked-to-chunked",
+                    true,
+                );
+                const chunkedChunkedPayload = JSON.parse(
+                    decoder.decode(chunkedChunked.body),
+                ) as {
+                    body: string;
+                    contentLength: string | null;
+                    transferEncoding: string | null;
+                };
+                assertEquals(chunkedChunkedPayload.body, "chunked-to-chunked");
+                assertEquals(chunkedChunkedPayload.contentLength, null);
+                assert(
+                    chunkedChunkedPayload.transferEncoding?.toLowerCase().includes(
+                        "chunked",
+                    ),
+                );
+                assert(
+                    chunkedChunked.headers.get("transfer-encoding")?.toLowerCase()
+                        .includes("chunked"),
+                );
+                assertEquals(chunkedChunked.headers.get("content-length"), null);
+            });
+        } finally {
+            await backend.close().catch(() => {});
             if (tarPath) {
                 await Deno.remove(tarPath).catch(() => {});
             }

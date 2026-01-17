@@ -1,12 +1,17 @@
 use std::{
+    cell::RefCell,
     io,
-    sync::{Arc, Mutex},
+    rc::Rc,
+    sync::{Arc, Mutex, Weak},
 };
 
 use arc_swap::{ArcSwap, ArcSwapOption};
 use std::net::TcpListener;
 
-use monoio::fs::File;
+use monoio::{
+    fs::File,
+    io::{AsyncWriteRent, AsyncWriteRentExt},
+};
 
 use crate::{
     config::StaticConfig,
@@ -43,11 +48,64 @@ impl SharedState {
     }
 }
 
+thread_local! {
+    static TAR_FILE_CACHE: RefCell<Vec<(Weak<Site>, Rc<File>)>> = RefCell::new(Vec::new());
+}
+
+fn get_tar_file(site: &Arc<Site>) -> io::Result<Rc<File>> {
+    TAR_FILE_CACHE.with(|x| {
+        let mut x = x.borrow_mut();
+        x.retain(|x| x.0.strong_count() != 0);
+        let site_weak = Arc::downgrade(site);
+        if let Some(x) = x.iter().find(|x| x.0.ptr_eq(&site_weak)) {
+            return Ok(x.1.clone());
+        }
+        let file = match site.tar_file.try_clone() {
+            Ok(x) => Rc::new(File::from_std(x).unwrap()),
+            Err(e) => {
+                eprintln!("failed to create tar handle: {}", e);
+                return Err(e);
+            }
+        };
+        x.push((Arc::downgrade(&site), file.clone()));
+        Ok(file)
+    })
+}
+
 pub async fn read_tar_entry(entry: Arc<TarEntry>, site: &Arc<Site>) -> io::Result<Vec<u8>> {
-    let file = site.tar_file.try_clone().and_then(File::from_std)?;
+    let file = get_tar_file(site)?;
     let size =
         usize::try_from(entry.size).map_err(|_| io::Error::from(io::ErrorKind::InvalidData))?;
     let (res, buf) = file.read_exact_at(vec![0u8; size], entry.offset).await;
     res?;
     Ok(buf)
+}
+
+pub async fn stream_tar_entry(
+    entry: Arc<TarEntry>,
+    site: &Arc<Site>,
+    chunk_size: usize,
+    w: &mut impl AsyncWriteRent,
+) -> std::io::Result<()> {
+    let file = get_tar_file(site)?;
+    let mut remaining = entry.size;
+    let mut offset = entry.offset;
+    let mut buffer = vec![0u8; chunk_size];
+    while remaining > 0 {
+        let read_len = remaining.min(chunk_size as u64) as usize;
+        let view = monoio::buf::SliceMut::new(buffer, 0, read_len);
+        let (res, view) = file.read_at(view, offset).await;
+        buffer = view.into_inner();
+        let n = res?;
+        if n == 0 {
+            return Err(std::io::Error::from(std::io::ErrorKind::InvalidData));
+        }
+        let view = monoio::buf::Slice::new(buffer, 0, n);
+        let (res, view) = w.write_all(view).await;
+        buffer = view.into_inner();
+        res?;
+        remaining -= n as u64;
+        offset += n as u64;
+    }
+    Ok(())
 }

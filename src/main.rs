@@ -1,5 +1,6 @@
 mod cli;
 mod config;
+mod http;
 mod hupwatch;
 mod json;
 mod logging;

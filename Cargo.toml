@@ -16,7 +16,9 @@ bytes = "1"
 caps = "0.5"
 faster-hex = "0.10"
 futures = "0.3"
-monoio = { version = "0.2", default-features = false, features = ["async-cancel", "bytes", "iouring", "utils", "sync"] }
+h2 = "0.4"
+monoio = { version = "0.2", default-features = false, features = ["async-cancel", "bytes", "iouring", "poll-io", "utils", "sync"] }
+monoio-compat = "0.2"
 monoio-rustls = { version = "0.4" }
 clap = { version = "4", features = ["derive"] }
 rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "logging", "aws_lc_rs"] }

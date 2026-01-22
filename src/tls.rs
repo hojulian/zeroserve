@@ -35,10 +35,11 @@ pub fn load_tls_if_configured(config: &Arc<StaticConfig>) -> Result<Option<TlsRu
                 .ok_or_else(|| anyhow!("no private key found in {}", key.display()))?
                 .map_err(|e| anyhow!("private key parse error: {e}"))?;
 
-            let tls_config = ServerConfig::builder()
+            let mut tls_config = ServerConfig::builder()
                 .with_no_client_auth()
                 .with_single_cert(certs, key)
                 .context("invalid certificate/key pair")?;
+            tls_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
             Ok(Some(TlsRuntime {
                 acceptor: TlsAcceptor::from(Arc::new(tls_config)),
             }))

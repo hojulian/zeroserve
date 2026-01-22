@@ -52,7 +52,7 @@ thread_local! {
     static TAR_FILE_CACHE: RefCell<Vec<(Weak<Site>, Rc<File>)>> = RefCell::new(Vec::new());
 }
 
-fn get_tar_file(site: &Arc<Site>) -> io::Result<Rc<File>> {
+pub(crate) fn get_tar_file(site: &Arc<Site>) -> io::Result<Rc<File>> {
     TAR_FILE_CACHE.with(|x| {
         let mut x = x.borrow_mut();
         x.retain(|x| x.0.strong_count() != 0);

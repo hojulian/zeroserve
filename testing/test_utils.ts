@@ -48,6 +48,43 @@ export async function withZeroserve(
   }
 }
 
+export async function withZeroserveTls(
+  tarPath: string,
+  certPath: string,
+  keyPath: string,
+  fn: (httpUrl: string, httpsUrl: string) => Promise<void>,
+): Promise<void> {
+  const zeroservePath = await getZeroservePath();
+  const httpPort = await getFreePort();
+  const httpsPort = await getFreePort();
+  const child = new Deno.Command(zeroservePath, {
+    args: [
+      "--addr",
+      `127.0.0.1:${httpPort}`,
+      "--tls-addr",
+      `127.0.0.1:${httpsPort}`,
+      "--cert",
+      certPath,
+      "--key",
+      keyPath,
+      "--disable-request-logging",
+      tarPath,
+    ],
+    cwd: repoRoot,
+    stdin: "null",
+    stdout: "null",
+    stderr: "inherit",
+  }).spawn();
+  const statusPromise = child.status;
+  try {
+    await waitForServer("127.0.0.1", httpPort, statusPromise);
+    await waitForServer("127.0.0.1", httpsPort, statusPromise);
+    await fn(`http://127.0.0.1:${httpPort}`, `https://127.0.0.1:${httpsPort}`);
+  } finally {
+    await stopProcess(child, statusPromise);
+  }
+}
+
 export async function hasBpfToolchain(): Promise<boolean> {
   return await hasCommand("clang") && await hasCommand("llc");
 }
@@ -179,4 +216,50 @@ async function raceWithTimeout<T>(
 
 function immediate(): Promise<null> {
   return new Promise((resolve) => queueMicrotask(() => resolve(null)));
+}
+
+export async function generateSelfSignedCert(): Promise<{
+  certPath: string;
+  keyPath: string;
+  cleanup: () => Promise<void>;
+}> {
+  const certPath = await Deno.makeTempFile({ suffix: ".pem" });
+  const keyPath = await Deno.makeTempFile({ suffix: ".pem" });
+
+  const genCmd = new Deno.Command("openssl", {
+    args: [
+      "req",
+      "-x509",
+      "-newkey",
+      "rsa:2048",
+      "-keyout",
+      keyPath,
+      "-out",
+      certPath,
+      "-days",
+      "1",
+      "-nodes",
+      "-subj",
+      "/CN=localhost",
+      "-addext",
+      "basicConstraints=CA:FALSE",
+      "-addext",
+      "subjectAltName=DNS:localhost,IP:127.0.0.1",
+    ],
+    stdout: "null",
+    stderr: "null",
+  });
+  const output = await genCmd.output();
+  if (!output.success) {
+    throw new Error("Failed to generate self-signed certificate");
+  }
+
+  return {
+    certPath,
+    keyPath,
+    cleanup: async () => {
+      await Deno.remove(certPath).catch(() => {});
+      await Deno.remove(keyPath).catch(() => {});
+    },
+  };
 }

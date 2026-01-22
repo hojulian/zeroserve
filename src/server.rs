@@ -15,15 +15,19 @@ use ::http::{
 };
 use anyhow::{Context, Result, anyhow};
 use bytes::Bytes;
-use futures::channel::oneshot;
+use futures::{
+    channel::oneshot,
+    future::{self, FutureExt},
+};
 use monoio::{
     buf::SliceMut,
     io::{
-        AsyncReadRent, AsyncReadRentExt, AsyncWriteRent, AsyncWriteRentExt, BufReader, BufWriter,
+        AsyncReadRent, AsyncReadRentExt, AsyncWriteRent, AsyncWriteRentExt, BufWriter, IntoPollIo,
         Split, Splitable,
     },
     net::{TcpListener, TcpStream},
 };
+use monoio_compat::StreamWrapper;
 use monoio_rustls::{ClientTlsStream, TlsConnector, TlsError};
 use rustls::{ClientConfig, RootCertStore, pki_types::ServerName};
 use ulid::Ulid;
@@ -41,6 +45,22 @@ use crate::{
 };
 
 type HttpBody = h1::Body;
+
+const H2_PREFACE: &[u8; 24] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+
+enum StaticBody {
+    Empty,
+    Bytes(Vec<u8>),
+    File(Arc<crate::site::TarEntry>),
+}
+
+struct StaticResponse {
+    status: StatusCode,
+    headers: ::http::HeaderMap,
+    body: StaticBody,
+    head_only: bool,
+    site: Arc<crate::site::Site>,
+}
 
 pub async fn amain(shared: Arc<SharedState>, script_runtime: Rc<ScriptRuntime>) -> Result<()> {
     if shared.config.tls_addr.is_some() {
@@ -91,8 +111,7 @@ async fn run_http_listener(
             } else {
                 addr
             };
-            if let Err(err) =
-                handle_connection(hup, stream, peer, state, Scheme::Http, script_runtime).await
+            if let Err(err) = handle_http_connection(hup, stream, peer, state, script_runtime).await
             {
                 async_log(
                     format!(
@@ -105,6 +124,20 @@ async fn run_http_listener(
             }
         });
     }
+}
+
+async fn handle_http_connection(
+    mut hup: impl Future<Output = ()> + Unpin + 'static,
+    stream: TcpStream,
+    peer: std::net::SocketAddr,
+    shared: Arc<SharedState>,
+    script_runtime: Rc<ScriptRuntime>,
+) -> Result<()> {
+    if is_h2c_preface(&stream).await? {
+        return handle_h2c_connection(hup, stream, peer, shared, script_runtime).await;
+    }
+
+    handle_h1_connection(&mut hup, stream, peer, shared, Scheme::Http, script_runtime).await
 }
 
 async fn run_tls_listener(
@@ -128,7 +161,7 @@ async fn run_tls_listener(
         if stream.set_nodelay(true).is_err() {
             continue;
         }
-        let hup = shared.hup.wait(stream.as_raw_fd())?;
+        let mut hup = shared.hup.wait(stream.as_raw_fd())?;
         let state = shared.clone();
         let script_runtime = script_runtime.clone();
         monoio::spawn(async move {
@@ -155,8 +188,30 @@ async fn run_tls_listener(
             };
             match tls_state.acceptor.accept(stream).await {
                 Ok(tls_stream) => {
-                    if let Err(err) = handle_connection(
-                        hup,
+                    let is_h2 = matches!(tls_stream.alpn_protocol().as_deref(), Some(b"h2"));
+                    if is_h2 {
+                        let io = StreamWrapper::new(tls_stream);
+                        if let Err(err) = handle_h2_connection(
+                            hup,
+                            io,
+                            reported_peer,
+                            state,
+                            script_runtime,
+                            Scheme::Https,
+                        )
+                        .await
+                        {
+                            async_log(
+                                format!(
+                                    "[listener] connection {} over h2/tls closed with error: {err:?}",
+                                    reported_peer
+                                )
+                                .into_bytes(),
+                            )
+                            .await;
+                        }
+                    } else if let Err(err) = handle_h1_connection(
+                        &mut hup,
                         tls_stream,
                         reported_peer,
                         state,
@@ -190,8 +245,41 @@ fn log_tls_error(peer: std::net::SocketAddr, error: TlsError) {
     eprintln!("TLS handshake with {peer} failed: {error:?}");
 }
 
-async fn handle_connection<IO>(
-    mut hup: impl Future<Output = ()> + Unpin + 'static,
+async fn is_h2c_preface(stream: &TcpStream) -> std::io::Result<bool> {
+    let mut buf = [0u8; 24];
+    loop {
+        stream.readable(false).await?;
+        let n = unsafe {
+            libc::recv(
+                stream.as_raw_fd(),
+                buf.as_mut_ptr().cast(),
+                buf.len(),
+                libc::MSG_PEEK,
+            )
+        };
+        if n == 0 {
+            return Ok(false);
+        }
+        if n < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.kind() == ErrorKind::Interrupted || err.kind() == ErrorKind::WouldBlock {
+                continue;
+            }
+            return Err(err);
+        }
+        let n = n as usize;
+        let slice = &buf[..n];
+        if !H2_PREFACE.starts_with(slice) {
+            return Ok(false);
+        }
+        if n >= H2_PREFACE.len() {
+            return Ok(true);
+        }
+    }
+}
+
+async fn handle_h1_connection<IO, H>(
+    hup: &mut H,
     io: IO,
     peer: std::net::SocketAddr,
     shared: Arc<SharedState>,
@@ -200,9 +288,9 @@ async fn handle_connection<IO>(
 ) -> Result<()>
 where
     IO: AsyncReadRent + AsyncWriteRent + Split + 'static,
+    H: Future<Output = ()> + Unpin + 'static,
 {
     let (r, w) = io.into_split();
-    let r = BufReader::new(r);
     let mut w = BufWriter::new(w);
     let mut reader = h1::H1Connection::new(r);
     loop {
@@ -225,7 +313,7 @@ where
             }
         };
 
-        let can_continue = handle_request(
+        let outcome = handle_request(
             request,
             &mut reader,
             &shared,
@@ -233,12 +321,81 @@ where
             peer,
             scheme,
             &mut w,
-            &mut hup,
+            hup,
         )
         .await;
-        if !can_continue {
+        if !outcome {
             break;
         }
+    }
+    Ok(())
+}
+
+async fn handle_h2c_connection(
+    hup: impl Future<Output = ()> + Unpin + 'static,
+    stream: TcpStream,
+    peer: std::net::SocketAddr,
+    shared: Arc<SharedState>,
+    script_runtime: Rc<ScriptRuntime>,
+) -> Result<()> {
+    let io = stream
+        .into_poll_io()
+        .map_err(|err| anyhow!("failed to enable h2 poll-io: {err}"))?;
+    handle_h2_connection(hup, io, peer, shared, script_runtime, Scheme::Http).await
+}
+
+async fn handle_h2_connection<IO>(
+    hup: impl Future<Output = ()> + Unpin + 'static,
+    io: IO,
+    peer: std::net::SocketAddr,
+    shared: Arc<SharedState>,
+    script_runtime: Rc<ScriptRuntime>,
+    scheme: Scheme,
+) -> Result<()>
+where
+    IO: monoio::io::poll_io::AsyncRead + monoio::io::poll_io::AsyncWrite + Unpin + 'static,
+{
+    let mut connection = h2::server::handshake(io)
+        .await
+        .map_err(|err| anyhow!("h2 handshake failed: {err}"))?;
+    let (_local_hup_tx, local_hup_rx) = oneshot::channel::<()>();
+    let hup = futures::future::select(local_hup_rx, hup)
+        .map(|_| ())
+        .shared();
+
+    loop {
+        let mut hup_wait = hup.clone();
+        let next = monoio::select! {
+            res = connection.accept() => res,
+            _ = &mut hup_wait => {
+                return Ok(());
+            }
+        };
+
+        let Some(result) = next else {
+            break;
+        };
+        let (request, respond) = match result {
+            Ok(value) => value,
+            Err(err) => {
+                eprintln!("h2 connection error from {peer}: {err:?}");
+                break;
+            }
+        };
+        let state = shared.clone();
+        let script_runtime = script_runtime.clone();
+        let hup = hup.clone();
+        let scheme = scheme;
+        monoio::spawn(async move {
+            if let Err(err) =
+                handle_h2_request(request, respond, state, script_runtime, peer, scheme, hup).await
+            {
+                async_log(
+                    format!("[h2] stream {} closed with error: {err:?}\n", peer).into_bytes(),
+                )
+                .await;
+            }
+        });
     }
     Ok(())
 }
@@ -337,11 +494,125 @@ async fn handle_request<R: AsyncReadRent>(
     true
 }
 
-async fn send_fixed(
-    w: &mut impl AsyncWriteRent,
-    mut res: ::http::Response<Bytes>,
-    metadata: &HashMap<String, String>,
-) {
+async fn handle_h2_request<H>(
+    request: ::http::Request<h2::RecvStream>,
+    mut respond: h2::server::SendResponse<Bytes>,
+    shared: Arc<SharedState>,
+    script_runtime: Rc<ScriptRuntime>,
+    peer: std::net::SocketAddr,
+    scheme: Scheme,
+    hup: future::Shared<H>,
+) -> Result<()>
+where
+    H: Future<Output = ()> + Unpin + 'static,
+{
+    let request_id = Ulid::new();
+    let (parts, body) = request.into_parts();
+    let mut head = RequestHead {
+        method: parts.method,
+        uri: parts.uri,
+        version: ::http::Version::HTTP_2,
+        headers: parts.headers,
+    };
+    ensure_host_header(&mut head);
+
+    if !shared.config.disable_request_logging {
+        log_request(request_id, peer, scheme, &head.method, &head.uri).await;
+    }
+    let head_only = head.method == Method::HEAD;
+
+    let script_request = build_script_request(request_id, &head, peer, scheme);
+    let script_request_fallback = script_request.clone();
+    let mut hup_wait = hup.clone();
+    let script_outcome = monoio::select! {
+        x = script_runtime.run_request(shared.site.load_full(), script_request) => x,
+        _ = &mut hup_wait => {
+          async_log(format!("[handle] {}: interrupted\n", request_id).into_bytes()).await;
+          return Ok(());
+        }
+    };
+    let script_outcome = match script_outcome {
+        Ok(outcome) => outcome,
+        Err(err) => {
+            async_log(format!("[handle] {}: script runtime: {:?}\n", request_id, err).into_bytes())
+                .await;
+            ScriptOutcome::from_request(script_request_fallback)
+        }
+    };
+
+    if let Err(err) = apply_script_request(&mut head, &script_outcome.request) {
+        async_log(
+            format!(
+                "[handle] {}: script request update: {:?}\n",
+                request_id, err
+            )
+            .into_bytes(),
+        )
+        .await;
+    }
+
+    if let Some(proxy_url) = script_outcome.reverse_proxy {
+        let mut hup_wait = hup.clone();
+        let res = monoio::select! {
+            x = reverse_proxy_request_h2(
+                &proxy_url,
+                head,
+                body,
+                &mut respond,
+                head_only,
+                &script_outcome.metadata,
+            ) => x,
+            _ = &mut hup_wait => Err(anyhow::anyhow!("interrupted")),
+        };
+        if let Err(err) = res {
+            async_log(format!("[handle] {}: reverse proxy: {:?}\n", request_id, err).into_bytes())
+                .await;
+        }
+        return Ok(());
+    }
+
+    if let Some(response) = script_outcome.response {
+        send_script_response_h2(&mut respond, response, head_only, &script_outcome.metadata)
+            .await?;
+        return Ok(());
+    }
+
+    match head.method {
+        Method::GET | Method::HEAD => {
+            if serve_static_h2(
+                &head,
+                &shared,
+                head_only,
+                &mut respond,
+                &script_outcome.metadata,
+            )
+            .await?
+            .is_none()
+            {
+                send_h2_response(
+                    &mut respond,
+                    not_found(),
+                    head_only,
+                    &script_outcome.metadata,
+                )
+                .await?;
+            }
+        }
+        _ => {
+            send_h2_response(
+                &mut respond,
+                method_not_allowed(),
+                head_only,
+                &script_outcome.metadata,
+            )
+            .await?;
+        }
+    }
+
+    Ok(())
+}
+
+fn ensure_content_length(res: &mut ::http::Response<Bytes>) {
     if !res.headers().contains_key(::http::header::CONTENT_LENGTH)
         && !res
             .headers()
@@ -352,6 +623,14 @@ async fn send_fixed(
         res.headers_mut()
             .insert(::http::header::CONTENT_LENGTH, length);
     }
+}
+
+async fn send_fixed(
+    w: &mut impl AsyncWriteRent,
+    mut res: ::http::Response<Bytes>,
+    metadata: &HashMap<String, String>,
+) {
+    ensure_content_length(&mut res);
     apply_metadata_response_headers(res.headers_mut(), metadata);
     let (parts, body) = res.into_parts();
     let _ = write_response_head(w, parts.status, &parts.headers).await;
@@ -361,12 +640,240 @@ async fn send_fixed(
     let _ = w.flush().await;
 }
 
+fn ensure_host_header(head: &mut RequestHead) {
+    if head.headers.contains_key(::http::header::HOST) {
+        return;
+    }
+    let Some(authority) = head.uri.authority() else {
+        return;
+    };
+    if let Ok(value) = HeaderValue::from_str(authority.as_str()) {
+        head.headers.insert(::http::header::HOST, value);
+    }
+}
+
+async fn send_h2_response(
+    respond: &mut h2::server::SendResponse<Bytes>,
+    mut res: ::http::Response<Bytes>,
+    head_only: bool,
+    metadata: &HashMap<String, String>,
+) -> Result<()> {
+    ensure_content_length(&mut res);
+    apply_metadata_response_headers(res.headers_mut(), metadata);
+    strip_hop_headers(res.headers_mut(), false);
+    let (parts, body) = res.into_parts();
+    let mut head = ::http::Response::builder()
+        .status(parts.status)
+        .version(::http::Version::HTTP_2)
+        .body(())
+        .map_err(|err| anyhow!("failed to build h2 response: {err}"))?;
+    *head.headers_mut() = parts.headers;
+    let end_stream = head_only || body.is_empty();
+    let mut stream = respond.send_response(head, end_stream)?;
+    if !end_stream {
+        send_h2_data(&mut stream, body, true).await?;
+    }
+    Ok(())
+}
+
+async fn send_h2_bytes_response(
+    respond: &mut h2::server::SendResponse<Bytes>,
+    status: StatusCode,
+    content_type: &str,
+    body: Vec<u8>,
+    head_only: bool,
+    metadata: &HashMap<String, String>,
+) -> Result<()> {
+    let headers = build_base_headers(body.len() as u64, content_type);
+    let mut res = ::http::Response::builder()
+        .status(status)
+        .body(Bytes::from(body))
+        .map_err(|err| anyhow!("failed to build h2 response: {err}"))?;
+    *res.headers_mut() = headers;
+    send_h2_response(respond, res, head_only, metadata).await
+}
+
+async fn send_script_response_h2(
+    respond: &mut h2::server::SendResponse<Bytes>,
+    response: ScriptResponse,
+    head_only: bool,
+    metadata: &HashMap<String, String>,
+) -> Result<()> {
+    let status = StatusCode::from_u16(response.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+    send_h2_bytes_response(
+        respond,
+        status,
+        "text/plain; charset=utf-8",
+        response.body,
+        head_only,
+        metadata,
+    )
+    .await
+}
+
+async fn send_h2_data(
+    stream: &mut h2::SendStream<Bytes>,
+    data: Bytes,
+    end_stream: bool,
+) -> Result<()> {
+    if data.is_empty() {
+        if end_stream {
+            stream.send_data(Bytes::new(), true)?;
+        }
+        return Ok(());
+    }
+
+    let mut offset = 0;
+    while offset < data.len() {
+        let remaining = data.len() - offset;
+        stream.reserve_capacity(remaining);
+        let capacity = future::poll_fn(|cx| stream.poll_capacity(cx)).await;
+        let capacity = match capacity {
+            Some(Ok(value)) => value,
+            Some(Err(err)) => return Err(anyhow!("h2 capacity error: {err}")),
+            None => return Err(anyhow!("h2 stream closed")),
+        };
+        if capacity == 0 {
+            // yield to event loop
+            monoio::time::sleep(Duration::from_millis(0)).await;
+            continue;
+        }
+        let to_send = remaining.min(capacity);
+        let chunk = data.slice(offset..offset + to_send);
+        let is_last = offset + to_send == data.len();
+        stream.send_data(chunk, end_stream && is_last)?;
+        offset += to_send;
+    }
+    Ok(())
+}
+
 async fn drain_payload<R: AsyncReadRent>(reader: &mut h1::H1Connection<R>, body: &mut h1::Body) {
     loop {
         match body.next_data(reader).await {
             Some(Ok(_)) => continue,
-            Some(Err(_)) => continue,
+            Some(Err(_)) => break,
             None => break,
+        }
+    }
+}
+
+async fn prepare_static_response(
+    head: &RequestHead,
+    shared: &Arc<SharedState>,
+    head_only: bool,
+    metadata: &HashMap<String, String>,
+) -> Option<StaticResponse> {
+    let path = normalize_request_path(head.uri.path())?;
+    let site = shared.site.load_full();
+    let entry = site.lookup(&path, &shared.config.index_file, shared.config.try_html)?;
+    let mime = guess_mime(&entry.path);
+
+    if should_template_replace(mime, metadata) {
+        let response = match read_tar_entry(entry.clone(), &site).await {
+            Ok(body) => {
+                let rendered = match std::str::from_utf8(&body) {
+                    Ok(text) => apply_template(text, metadata).into_bytes(),
+                    Err(_) => body,
+                };
+                let headers = build_base_headers(rendered.len() as u64, mime);
+                StaticResponse {
+                    status: StatusCode::OK,
+                    headers,
+                    body: StaticBody::Bytes(rendered),
+                    head_only,
+                    site,
+                }
+            }
+            Err(err) => {
+                eprintln!("failed to render {}: {:?}", entry.path, err);
+                let headers = build_base_headers(
+                    b"Internal Server Error".len() as u64,
+                    "text/plain; charset=utf-8",
+                );
+                StaticResponse {
+                    status: StatusCode::INTERNAL_SERVER_ERROR,
+                    headers,
+                    body: StaticBody::Bytes(b"Internal Server Error".to_vec()),
+                    head_only,
+                    site,
+                }
+            }
+        };
+        return Some(response);
+    }
+
+    if if_none_match_matches(&head.headers, &entry.etag) {
+        let mut headers = ::http::HeaderMap::new();
+        headers.insert(
+            ::http::header::SERVER,
+            HeaderValue::from_static(crate::SERVER_HEADER),
+        );
+        headers.insert(::http::header::ETAG, etag_header_value(&entry.etag));
+        headers.insert(
+            ::http::header::CONTENT_LENGTH,
+            HeaderValue::from_static("0"),
+        );
+        return Some(StaticResponse {
+            status: StatusCode::NOT_MODIFIED,
+            headers,
+            body: StaticBody::Empty,
+            head_only: true,
+            site,
+        });
+    }
+
+    let mut headers = build_base_headers(entry.size, mime);
+    headers.insert(::http::header::ETAG, etag_header_value(&entry.etag));
+    headers.insert(
+        ::http::header::ACCEPT_RANGES,
+        ::http::HeaderValue::from_static("bytes"),
+    );
+    Some(StaticResponse {
+        status: StatusCode::OK,
+        headers,
+        body: StaticBody::File(entry),
+        head_only,
+        site,
+    })
+}
+
+async fn send_static_response_h1(
+    w: &mut impl AsyncWriteRent,
+    shared: &Arc<SharedState>,
+    peer: std::net::SocketAddr,
+    mut response: StaticResponse,
+    metadata: &HashMap<String, String>,
+) {
+    apply_metadata_response_headers(&mut response.headers, metadata);
+    let _ = write_response_head(w, response.status, &response.headers).await;
+    if response.head_only {
+        let _ = w.flush().await;
+        return;
+    }
+
+    match response.body {
+        StaticBody::Empty => {
+            let _ = w.flush().await;
+        }
+        StaticBody::Bytes(body) => {
+            if !body.is_empty() {
+                let _ = w.write_all(body).await;
+            }
+            let _ = w.flush().await;
+        }
+        StaticBody::File(entry) => {
+            match stream_tar_entry(entry.clone(), &response.site, shared.config.chunk_size, w).await
+            {
+                Ok(()) => {
+                    let _ = w.flush().await;
+                }
+                Err(e) => {
+                    if e.kind() != ErrorKind::ConnectionReset && e.kind() != ErrorKind::BrokenPipe {
+                        eprintln!("aborting stream with {} due to io error: {:?}", peer, e);
+                        let _ = w.shutdown().await;
+                    }
+                }
+            };
         }
     }
 }
@@ -379,67 +886,87 @@ async fn serve_static(
     w: &mut impl AsyncWriteRent,
     metadata: &HashMap<String, String>,
 ) -> Option<()> {
-    let path = normalize_request_path(head.uri.path())?;
-    let site = shared.site.load_full();
-    let entry = site.lookup(&path, &shared.config.index_file, shared.config.try_html)?;
-    let mime = guess_mime(&entry.path);
-
-    if should_template_replace(mime, metadata) {
-        match read_tar_entry(entry.clone(), &site).await {
-            Ok(body) => {
-                let rendered = match std::str::from_utf8(&body) {
-                    Ok(text) => apply_template(text, metadata).into_bytes(),
-                    Err(_) => body,
-                };
-                send_bytes_response(w, StatusCode::OK, mime, rendered, head_only, metadata).await;
-            }
-            Err(err) => {
-                eprintln!("failed to render {}: {:?}", entry.path, err);
-                send_bytes_response(
-                    w,
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "text/plain; charset=utf-8",
-                    b"Internal Server Error".to_vec(),
-                    head_only,
-                    metadata,
-                )
-                .await;
-            }
-        }
-        return Some(());
-    }
-
-    if if_none_match_matches(&head.headers, &entry.etag) {
-        send_not_modified(w, &entry.etag, metadata).await;
-        return Some(());
-    }
-
-    let mut headers = build_base_headers(entry.size, mime);
-    headers.insert(::http::header::ETAG, etag_header_value(&entry.etag));
-    headers.insert(
-        ::http::header::ACCEPT_RANGES,
-        ::http::HeaderValue::from_static("bytes"),
-    );
-    apply_metadata_response_headers(&mut headers, metadata);
-    let _ = write_response_head(w, StatusCode::OK, &headers).await;
-
-    if head_only {
-        let _ = w.flush().await;
-        return Some(());
-    }
-
-    match stream_tar_entry(entry.clone(), &site, shared.config.chunk_size, w).await {
-        Ok(()) => {
-            let _ = w.flush().await;
-        }
-        Err(e) => {
-            if e.kind() != ErrorKind::ConnectionReset && e.kind() != ErrorKind::BrokenPipe {
-                eprintln!("aborting stream with {} due to io error: {:?}", peer, e);
-                let _ = w.shutdown().await;
-            }
-        }
-    };
+    let response = prepare_static_response(head, shared, head_only, metadata).await?;
+    send_static_response_h1(w, shared, peer, response, metadata).await;
     Some(())
+}
+
+async fn serve_static_h2(
+    head: &RequestHead,
+    shared: &Arc<SharedState>,
+    head_only: bool,
+    respond: &mut h2::server::SendResponse<Bytes>,
+    metadata: &HashMap<String, String>,
+) -> Result<Option<()>> {
+    let response = match prepare_static_response(head, shared, head_only, metadata).await {
+        Some(response) => response,
+        None => return Ok(None),
+    };
+    send_static_response_h2(respond, shared, response, metadata).await?;
+    Ok(Some(()))
+}
+
+async fn send_static_response_h2(
+    respond: &mut h2::server::SendResponse<Bytes>,
+    shared: &Arc<SharedState>,
+    mut response: StaticResponse,
+    metadata: &HashMap<String, String>,
+) -> Result<()> {
+    apply_metadata_response_headers(&mut response.headers, metadata);
+    strip_hop_headers(&mut response.headers, false);
+    let mut head = ::http::Response::builder()
+        .status(response.status)
+        .version(::http::Version::HTTP_2)
+        .body(())
+        .map_err(|err| anyhow!("failed to build h2 response: {err}"))?;
+    *head.headers_mut() = response.headers;
+
+    let body_is_empty = match &response.body {
+        StaticBody::Empty => true,
+        StaticBody::Bytes(body) => body.is_empty(),
+        StaticBody::File(entry) => entry.size == 0,
+    };
+    let end_stream = response.head_only || body_is_empty;
+    let mut stream = respond.send_response(head, end_stream)?;
+    if end_stream {
+        return Ok(());
+    }
+
+    match response.body {
+        StaticBody::Empty => Ok(()),
+        StaticBody::Bytes(body) => send_h2_data(&mut stream, Bytes::from(body), true).await,
+        StaticBody::File(entry) => {
+            stream_tar_entry_h2(entry, &response.site, shared.config.chunk_size, &mut stream).await
+        }
+    }
+}
+
+async fn stream_tar_entry_h2(
+    entry: Arc<crate::site::TarEntry>,
+    site: &Arc<crate::site::Site>,
+    chunk_size: usize,
+    stream: &mut h2::SendStream<Bytes>,
+) -> Result<()> {
+    let file = crate::shared::get_tar_file(site)?;
+    let mut remaining = entry.size;
+    let mut offset = entry.offset;
+    let mut buffer = vec![0u8; chunk_size];
+    while remaining > 0 {
+        let read_len = remaining.min(chunk_size as u64) as usize;
+        let view = monoio::buf::SliceMut::new(buffer, 0, read_len);
+        let (res, view) = file.read_at(view, offset).await;
+        buffer = view.into_inner();
+        let n = res?;
+        if n == 0 {
+            return Err(anyhow!("h2 static stream failed: empty read"));
+        }
+        let is_last = remaining == n as u64;
+        let data = Bytes::copy_from_slice(&buffer[..n]);
+        send_h2_data(stream, data, is_last).await?;
+        remaining -= n as u64;
+        offset += n as u64;
+    }
+    Ok(())
 }
 
 fn should_template_replace(content_type: &str, metadata: &HashMap<String, String>) -> bool {
@@ -566,26 +1093,6 @@ async fn send_bytes_response(
     let _ = w.flush().await;
 }
 
-async fn send_not_modified(
-    w: &mut impl AsyncWriteRent,
-    etag: &str,
-    metadata: &HashMap<String, String>,
-) {
-    let mut headers = ::http::HeaderMap::new();
-    headers.insert(
-        ::http::header::SERVER,
-        HeaderValue::from_static(crate::SERVER_HEADER),
-    );
-    headers.insert(::http::header::ETAG, etag_header_value(etag));
-    headers.insert(
-        ::http::header::CONTENT_LENGTH,
-        HeaderValue::from_static("0"),
-    );
-    apply_metadata_response_headers(&mut headers, metadata);
-    let _ = write_response_head(w, StatusCode::NOT_MODIFIED, &headers).await;
-    let _ = w.flush().await;
-}
-
 fn build_script_request(
     request_id: Ulid,
     head: &RequestHead,
@@ -609,11 +1116,17 @@ fn build_script_request(
         }
     }
 
+    // Build URI as path + query (if present) to be consistent between h1 and h2
+    let uri = match head.uri.query() {
+        Some(q) => format!("{}?{}", head.uri.path(), q),
+        None => head.uri.path().to_string(),
+    };
+
     ScriptRequest {
         request_id,
         method: head.method.as_str().to_string(),
         path: head.uri.path().to_string(),
-        uri: head.uri.to_string(),
+        uri,
         query,
         scheme: scheme.as_str().to_string(),
         peer: peer.to_string(),
@@ -769,6 +1282,77 @@ async fn reverse_proxy_request(
     Ok(outcome.keep_client)
 }
 
+async fn reverse_proxy_request_h2(
+    backend_url: &str,
+    mut head: RequestHead,
+    body: h2::RecvStream,
+    respond: &mut h2::server::SendResponse<Bytes>,
+    head_only: bool,
+    metadata: &HashMap<String, String>,
+) -> Result<()> {
+    let target = match parse_backend_target(backend_url) {
+        Ok(target) => target,
+        Err(err) => {
+            return Err(err);
+        }
+    };
+    let uri = match build_backend_uri(&target, &head.uri) {
+        Ok(uri) => uri,
+        Err(err) => {
+            return Err(err);
+        }
+    };
+
+    let has_body = !body.is_end_stream();
+    let mut headers = head.headers;
+    strip_hop_headers(&mut headers, false);
+    let chunked = apply_proxy_request_headers_h2(&mut headers, has_body);
+    let host_header = target.host_header();
+    let host_header_value = match ::http::HeaderValue::from_str(&host_header) {
+        Ok(value) => value,
+        Err(_) => {
+            return Err(anyhow!("invalid backend host header"));
+        }
+    };
+    headers.insert(::http::header::HOST, host_header_value);
+
+    head.uri = uri;
+    head.headers = headers;
+    head.version = ::http::Version::HTTP_11;
+
+    let pool_key = PoolKey::new(
+        target.host.clone(),
+        target.port,
+        matches!(target.scheme, BackendScheme::Https),
+    );
+    let mut conn = match pool::take_connection(&pool_key) {
+        Some(conn) => conn,
+        None => match connect_backend(&target).await {
+            Ok(conn) => conn,
+            Err(err) => {
+                return Err(err);
+            }
+        },
+    };
+
+    let reuse_backend = match &mut conn {
+        PooledConnection::Http(codec) => {
+            proxy_over_connection_h2(codec, head, body, respond, head_only, metadata, chunked)
+                .await?
+        }
+        PooledConnection::Https(codec) => {
+            proxy_over_connection_h2(codec, head, body, respond, head_only, metadata, chunked)
+                .await?
+        }
+    };
+
+    if reuse_backend {
+        pool::return_connection(pool_key, conn);
+    }
+
+    Ok(())
+}
+
 async fn connect_backend(target: &BackendTarget) -> Result<PooledConnection> {
     thread_local! {
         static DNS_CACHE: RefCell<mini_moka::unsync::Cache<String, Arc<Vec<SocketAddr>>>> =
@@ -916,6 +1500,62 @@ where
     })
 }
 
+async fn proxy_over_connection_h2<IO>(
+    conn: &mut h1::H1Connection<IO>,
+    head: RequestHead,
+    mut body: h2::RecvStream,
+    respond: &mut h2::server::SendResponse<Bytes>,
+    head_only: bool,
+    metadata: &HashMap<String, String>,
+    chunked: bool,
+) -> Result<bool>
+where
+    IO: AsyncReadRent + AsyncWriteRent + Split,
+{
+    h1::write_request_head(conn.io_mut()?, &head)
+        .await
+        .map_err(|err| anyhow!("failed to send proxy request head: {err}"))?;
+    forward_h2_request_body(conn, &mut body, chunked)
+        .await
+        .map_err(|err| anyhow!("failed to send proxy request body: {err}"))?;
+
+    let response = match conn.next_response().await {
+        Ok(Some(resp)) => resp,
+        Ok(None) => return Err(anyhow!("proxy backend closed without response")),
+        Err(err) => return Err(anyhow!("failed to read proxy response: {err}")),
+    };
+
+    let (resp_head, mut resp_body) = response.into_parts();
+    let status = resp_head.status;
+    let mut can_reuse = should_reuse_proxy_connection(resp_head.version, &resp_head.headers);
+    let mut headers = resp_head.headers;
+    strip_hop_headers(&mut headers, false);
+    let body_hint = resp_body.hint();
+    if resp_body.is_eof() {
+        can_reuse = false;
+    }
+
+    let send_body = should_send_proxy_body(status, body_hint, head_only);
+    apply_proxy_response_headers(&mut headers, body_hint, send_body);
+    headers.remove(::http::header::TRANSFER_ENCODING);
+    apply_metadata_response_headers(&mut headers, metadata);
+    let mut head = ::http::Response::builder()
+        .status(status)
+        .version(::http::Version::HTTP_2)
+        .body(())
+        .map_err(|err| anyhow!("failed to build h2 response: {err}"))?;
+    *head.headers_mut() = headers;
+    let mut stream = respond.send_response(head, !send_body)?;
+
+    if !send_body {
+        drain_proxy_payload(conn, &mut resp_body).await?;
+        return Ok(can_reuse);
+    }
+
+    forward_proxy_body_h2(&mut stream, conn, &mut resp_body).await?;
+    Ok(can_reuse)
+}
+
 fn should_reuse_proxy_connection(version: ::http::Version, headers: &::http::HeaderMap) -> bool {
     if version != ::http::Version::HTTP_11 {
         return false;
@@ -985,6 +1625,81 @@ fn apply_proxy_request_headers(headers: &mut ::http::HeaderMap, body: &h1::Body)
     } else {
         headers.remove(::http::header::TRANSFER_ENCODING);
     }
+}
+
+fn apply_proxy_request_headers_h2(headers: &mut ::http::HeaderMap, has_body: bool) -> bool {
+    if !has_body {
+        headers.remove(::http::header::TRANSFER_ENCODING);
+        return false;
+    }
+    if h1::content_length(headers).is_some() {
+        headers.remove(::http::header::TRANSFER_ENCODING);
+        return false;
+    }
+    headers.remove(::http::header::CONTENT_LENGTH);
+    headers.insert(
+        ::http::header::TRANSFER_ENCODING,
+        ::http::HeaderValue::from_static("chunked"),
+    );
+    true
+}
+
+async fn forward_h2_request_body<IO>(
+    conn: &mut h1::H1Connection<IO>,
+    body: &mut h2::RecvStream,
+    chunked: bool,
+) -> Result<()>
+where
+    IO: AsyncWriteRent,
+{
+    if body.is_end_stream() {
+        return Ok(());
+    }
+
+    if chunked {
+        while let Some(chunk) = body.data().await {
+            let chunk = chunk.map_err(|err| anyhow!("proxy request body read failed: {err}"))?;
+            h1::write_chunk(conn.io_mut()?, chunk.as_ref())
+                .await
+                .map_err(|err| anyhow!("failed to write proxy body chunk: {err}"))?;
+            let _ = body.flow_control().release_capacity(chunk.len());
+        }
+        h1::write_chunk_end(conn.io_mut()?)
+            .await
+            .map_err(|err| anyhow!("failed to write proxy body end: {err}"))?;
+    } else {
+        while let Some(chunk) = body.data().await {
+            let chunk = chunk.map_err(|err| anyhow!("proxy request body read failed: {err}"))?;
+            let (res, _) = conn.io_mut()?.write_all(chunk.to_vec()).await;
+            res.map_err(|err| anyhow!("failed to write proxy body: {err}"))?;
+            let _ = body.flow_control().release_capacity(chunk.len());
+        }
+    }
+    let _ = conn.io_mut()?.flush().await;
+    Ok(())
+}
+
+async fn forward_proxy_body_h2<IO>(
+    stream: &mut h2::SendStream<Bytes>,
+    conn: &mut h1::H1Connection<IO>,
+    body: &mut h1::Body,
+) -> Result<()>
+where
+    IO: AsyncReadRent,
+{
+    let mut sent_any = false;
+    let mut next = body.next_data(conn).await;
+    while let Some(chunk) = next {
+        let chunk = chunk.map_err(|err| anyhow!("proxy body read failed: {err}"))?;
+        next = body.next_data(conn).await;
+        let is_last = next.is_none();
+        send_h2_data(stream, chunk, is_last).await?;
+        sent_any = true;
+    }
+    if !sent_any {
+        send_h2_data(stream, Bytes::new(), true).await?;
+    }
+    Ok(())
 }
 
 async fn write_response_head(
@@ -1079,6 +1794,7 @@ where
                 h1::write_chunk(w, chunk.as_ref())
                     .await
                     .map_err(|err| anyhow!("failed to write proxy body chunk: {err}"))?;
+                let _ = w.flush().await;
             }
             h1::write_chunk_end(w)
                 .await
@@ -1336,7 +2052,7 @@ async fn log_request(
     .await
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum Scheme {
     Http,
     Https,

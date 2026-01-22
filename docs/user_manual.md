@@ -6,6 +6,8 @@ Zeroserve is a high-performance, scriptable HTTP server that uses `io_uring` and
 serves a static website from a tarball, and optionally runs eBPF request scripts.
 It supports HTTP, HTTPS, hot reload, a small templating pass for text responses, and
 an opt-in reverse proxy from scripts.
+The HTTP listener also accepts HTTP/2 cleartext (h2c) via prior knowledge.
+HTTPS negotiates HTTP/2 (h2) via ALPN with HTTP/1.1 fallback.
 
 ## Quick start
 
@@ -112,7 +114,8 @@ This is useful for replacing the tarball and certificate in place without downti
 
 ## TLS
 
-To enable HTTPS, provide a TLS address plus certificate and key:
+To enable HTTPS, provide a TLS address plus certificate and key. HTTPS supports
+HTTP/2 via ALPN (h2) with HTTP/1.1 fallback:
 
 ```bash
 zeroserve --tls-addr 0.0.0.0:8443 --cert certificate.pem --key key.pem site.tar

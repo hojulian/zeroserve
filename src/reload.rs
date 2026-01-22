@@ -41,13 +41,7 @@ pub fn start_reload_thread(
     let reload_signal_file = shared.config.reload_signal_file.clone();
 
     // Create signalfd for SIGHUP
-    let sfd = unsafe {
-        libc::signalfd(
-            -1,
-            &sighup_blocked.mask,
-            libc::SFD_NONBLOCK | libc::SFD_CLOEXEC,
-        )
-    };
+    let sfd = unsafe { libc::signalfd(-1, &sighup_blocked.mask, libc::SFD_CLOEXEC) };
     if sfd < 0 {
         return Err(std::io::Error::last_os_error()).context("failed to create signalfd");
     }

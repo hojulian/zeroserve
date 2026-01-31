@@ -42,7 +42,7 @@ use crate::{
         BodyReadError, BodySource, ScriptOutcome, ScriptRequest, ScriptResponse, ScriptRuntime,
     },
     shared::{SharedState, read_tar_entry, stream_tar_entry},
-    site::{guess_mime, normalize_request_path},
+    site::{NormalizedPath, guess_mime, normalize_request_path},
     thread_pool::DNS_TP,
 };
 
@@ -502,7 +502,16 @@ async fn handle_request<R: AsyncReadRent + 'static>(
     let (body_source, body_state) =
         create_h1_body_source(reader, body, shared.config.max_buffered_body_size);
 
-    let script_request = build_script_request(request_id, &head, peer, scheme);
+    // Normalize the path once for the entire request pipeline
+    let Some(normalized_path) = normalize_request_path(head.uri.path()) else {
+        // Invalid path (e.g., path traversal escape attempt)
+        let (mut reader, mut body) = body_state.borrow_mut().take().unwrap();
+        drain_payload(&mut reader, &mut body).await;
+        send_fixed(w, bad_request(), &HashMap::new()).await;
+        return (true, reader);
+    };
+
+    let script_request = build_script_request(request_id, &head, peer, scheme, &normalized_path);
     let script_request_fallback = script_request.clone();
     let script_outcome = monoio::select! {
         x = script_runtime.run_request(shared.site.load_full(), script_request, body_source) => x,
@@ -570,7 +579,7 @@ async fn handle_request<R: AsyncReadRent + 'static>(
 
     match head.method {
         Method::GET | Method::HEAD => {
-            if serve_static(&head, shared, head_only, peer, w, &script_outcome.metadata)
+            if serve_static(&head, shared, head_only, peer, w, &script_outcome.metadata, &normalized_path)
                 .await
                 .is_none()
             {
@@ -613,7 +622,22 @@ where
     let (body_source, body_state) =
         create_h2_body_source(body, shared.config.max_buffered_body_size);
 
-    let script_request = build_script_request(request_id, &head, peer, scheme);
+    // Normalize the path once for the entire request pipeline
+    let Some(normalized_path) = normalize_request_path(head.uri.path()) else {
+        // Invalid path (e.g., path traversal escape attempt)
+        send_h2_bytes_response(
+            &mut respond,
+            StatusCode::BAD_REQUEST,
+            "text/plain; charset=utf-8",
+            b"Bad Request".to_vec(),
+            head_only,
+            &HashMap::new(),
+        )
+        .await?;
+        return Ok(());
+    };
+
+    let script_request = build_script_request(request_id, &head, peer, scheme, &normalized_path);
     let script_request_fallback = script_request.clone();
     let mut hup_wait = hup.clone();
     let script_outcome = monoio::select! {
@@ -692,6 +716,7 @@ where
                 head_only,
                 &mut respond,
                 &script_outcome.metadata,
+                &normalized_path,
             )
             .await?
             .is_none()
@@ -869,10 +894,10 @@ async fn prepare_static_response(
     shared: &Arc<SharedState>,
     head_only: bool,
     metadata: &HashMap<String, String>,
+    normalized_path: &NormalizedPath,
 ) -> Option<StaticResponse> {
-    let path = normalize_request_path(head.uri.path())?;
     let site = shared.site.load_full();
-    let entry = site.lookup(&path, &shared.config.index_file, shared.config.try_html)?;
+    let entry = site.lookup(normalized_path, &shared.config.index_file, shared.config.try_html)?;
     let mime = guess_mime(&entry.path);
 
     if should_template_replace(mime, metadata) {
@@ -992,8 +1017,9 @@ async fn serve_static(
     peer: std::net::SocketAddr,
     w: &mut impl AsyncWriteRent,
     metadata: &HashMap<String, String>,
+    normalized_path: &NormalizedPath,
 ) -> Option<()> {
-    let response = prepare_static_response(head, shared, head_only, metadata).await?;
+    let response = prepare_static_response(head, shared, head_only, metadata, normalized_path).await?;
     send_static_response_h1(w, shared, peer, response, metadata).await;
     Some(())
 }
@@ -1004,8 +1030,9 @@ async fn serve_static_h2(
     head_only: bool,
     respond: &mut h2::server::SendResponse<Bytes>,
     metadata: &HashMap<String, String>,
+    normalized_path: &NormalizedPath,
 ) -> Result<Option<()>> {
-    let response = match prepare_static_response(head, shared, head_only, metadata).await {
+    let response = match prepare_static_response(head, shared, head_only, metadata, normalized_path).await {
         Some(response) => response,
         None => return Ok(None),
     };
@@ -1205,6 +1232,7 @@ fn build_script_request(
     head: &RequestHead,
     peer: std::net::SocketAddr,
     scheme: Scheme,
+    normalized_path: &NormalizedPath,
 ) -> ScriptRequest {
     let mut headers = HashMap::new();
     for (name, value) in head.headers.iter() {
@@ -1212,6 +1240,13 @@ fn build_script_request(
             headers.insert(name.as_str().to_ascii_lowercase(), value.to_string());
         }
     }
+
+    // Convert NormalizedPath to sanitized path string (with leading /)
+    let path = if normalized_path.relative().is_empty() {
+        "/".to_string()
+    } else {
+        format!("/{}", normalized_path.relative())
+    };
 
     let query = head.uri.query().unwrap_or("").to_string();
     let mut query_params = HashMap::new();
@@ -1223,16 +1258,16 @@ fn build_script_request(
         }
     }
 
-    // Build URI as path + query (if present) to be consistent between h1 and h2
+    // Build URI as sanitized path + query (if present)
     let uri = match head.uri.query() {
-        Some(q) => format!("{}?{}", head.uri.path(), q),
-        None => head.uri.path().to_string(),
+        Some(q) => format!("{}?{}", path, q),
+        None => path.clone(),
     };
 
     ScriptRequest {
         request_id,
         method: head.method.as_str().to_string(),
-        path: head.uri.path().to_string(),
+        path,
         uri,
         query,
         scheme: scheme.as_str().to_string(),
@@ -2123,6 +2158,10 @@ fn format_host_port(host: &str, port: u16, is_ipv6: bool) -> String {
 
 fn not_found() -> ::http::Response<Bytes> {
     text_response(StatusCode::NOT_FOUND, "Not Found")
+}
+
+fn bad_request() -> ::http::Response<Bytes> {
+    text_response(StatusCode::BAD_REQUEST, "Bad Request")
 }
 
 fn method_not_allowed() -> ::http::Response<Bytes> {

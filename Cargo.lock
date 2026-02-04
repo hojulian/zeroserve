@@ -96,9 +96,9 @@ checksum = "7c02d123df017efcdfbd739ef81735b36c5ba83ec3c59c80a9d7ecc718f92e50"
 
 [[package]]
 name = "async-ebpf"
-version = "0.2.1"
+version = "0.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2713c43dd4f3a309e7d56e425ef46d6944ced0f0ecc7c81dffeb2e4eca97ae02"
+checksum = "83475f5f0c939ed959219642f0f4704b9885b47c33e54f9672d839b2fa4e617e"
 dependencies = [
  "bindgen",
  "cmake",
@@ -109,7 +109,6 @@ dependencies = [
  "memmap2",
  "parking_lot",
  "rand 0.8.5",
- "rand_chacha 0.3.1",
  "scopeguard",
  "thiserror 1.0.69",
  "tracing",

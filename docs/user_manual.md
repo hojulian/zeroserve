@@ -6,8 +6,6 @@ Zeroserve is a high-performance, scriptable HTTP server that uses `io_uring` and
 serves a static website from a tarball, and optionally runs eBPF request scripts.
 It supports HTTP, HTTPS, hot reload, a small templating pass for text responses, and
 an opt-in reverse proxy from scripts.
-The HTTP listener also accepts HTTP/2 cleartext (h2c) via prior knowledge.
-HTTPS negotiates HTTP/2 (h2) via ALPN with HTTP/1.1 fallback.
 
 ## Quick start
 
@@ -81,6 +79,11 @@ Key options:
 - `--enable-netns-isolation`: Enable Linux network namespace isolation.
 - `--preempt-timer-interval-ms <MS>`: Script preemption timer interval.
 - `--sqpoll-idle-ms <MS>`: Enable io_uring sqpoll with idle timeout.
+- `--validate-hostnames <HOSTNAMES>`: Comma-separated list of allowed hostnames.
+  Requests with a non-matching `Host` header (or HTTP/2 `:authority`) receive a
+  `421 Misdirected Request` response. Supports IPv4, IPv6 (bracket notation), and
+  hostnames with optional ports (e.g., `example.com,api.example.com,[::1]`).
+  Matching is case-insensitive and port numbers are stripped before comparison.
 
 Examples:
 
@@ -98,6 +101,9 @@ zeroserve --try-html --enable-proxy-protocol site.tar
 
 # Socket activation (inherit pre-bound sockets)
 zeroserve --addr fd:3 --tls-addr fd:4 --cert cert.pem --key key.pem site.tar
+
+# Hostname validation (reject requests not matching allowed hostnames)
+zeroserve --validate-hostnames example.com,www.example.com,[::1] site.tar
 ```
 
 ## Routing and file lookup

@@ -24,6 +24,7 @@ pub struct StaticConfig {
     pub max_buffered_body_size: usize,
     pub max_request_external_memory_footprint: u64,
     pub max_rate_limit_buckets: usize,
+    pub validate_hostnames: Vec<String>,
 }
 
 impl TryFrom<Cli> for StaticConfig {
@@ -80,6 +81,7 @@ impl TryFrom<Cli> for StaticConfig {
             max_request_external_memory_footprint: (cli.max_request_external_memory_footprint_kb
                 * 1024) as u64,
             max_rate_limit_buckets: cli.max_rate_limit_buckets,
+            validate_hostnames: cli.validate_hostnames,
         })
     }
 }

@@ -502,6 +502,21 @@ async fn handle_request<R: AsyncReadRent + 'static>(
     let (body_source, body_state) =
         create_h1_body_source(reader, body, shared.config.max_buffered_body_size);
 
+    // Validate hostname if configured
+    if !shared.config.validate_hostnames.is_empty() {
+        let host = head
+            .headers
+            .get(::http::header::HOST)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        if !is_valid_hostname(host, &shared.config.validate_hostnames) {
+            let (mut reader, mut body) = body_state.borrow_mut().take().unwrap();
+            drain_payload(&mut reader, &mut body).await;
+            send_fixed(w, misdirected_request(), &HashMap::new()).await;
+            return (true, reader);
+        }
+    }
+
     // Normalize the path once for the entire request pipeline
     let Some(normalized_path) = normalize_request_path(head.uri.path()) else {
         // Invalid path (e.g., path traversal escape attempt)
@@ -541,6 +556,22 @@ async fn handle_request<R: AsyncReadRent + 'static>(
         .await;
     }
 
+    // Recalculate normalized path if the URI was changed by script
+    let normalized_path = if script_outcome.request.uri_changed() {
+        match normalize_request_path(head.uri.path()) {
+            Some(path) => path,
+            None => {
+                // Invalid path after script modification
+                let (mut reader, mut body) = body_state.borrow_mut().take().unwrap();
+                drain_payload(&mut reader, &mut body).await;
+                send_fixed(w, bad_request(), &HashMap::new()).await;
+                return (true, reader);
+            }
+        }
+    } else {
+        normalized_path
+    };
+
     // Take reader and body back from shared state
     let (mut reader, mut body) = body_state.borrow_mut().take().unwrap();
 
@@ -579,9 +610,17 @@ async fn handle_request<R: AsyncReadRent + 'static>(
 
     match head.method {
         Method::GET | Method::HEAD => {
-            if serve_static(&head, shared, head_only, peer, w, &script_outcome.metadata, &normalized_path)
-                .await
-                .is_none()
+            if serve_static(
+                &head,
+                shared,
+                head_only,
+                peer,
+                w,
+                &script_outcome.metadata,
+                &normalized_path,
+            )
+            .await
+            .is_none()
             {
                 send_fixed(w, not_found(), &script_outcome.metadata).await
             }
@@ -618,6 +657,27 @@ where
         log_request(request_id, peer, scheme, &head.method, &head.uri).await;
     }
     let head_only = head.method == Method::HEAD;
+
+    // Validate hostname if configured
+    if !shared.config.validate_hostnames.is_empty() {
+        let host = head
+            .headers
+            .get(::http::header::HOST)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        if !is_valid_hostname(host, &shared.config.validate_hostnames) {
+            send_h2_bytes_response(
+                &mut respond,
+                StatusCode::MISDIRECTED_REQUEST,
+                "text/plain; charset=utf-8",
+                b"Misdirected Request".to_vec(),
+                head_only,
+                &HashMap::new(),
+            )
+            .await?;
+            return Ok(());
+        }
+    }
 
     let (body_source, body_state) =
         create_h2_body_source(body, shared.config.max_buffered_body_size);
@@ -666,6 +726,28 @@ where
         )
         .await;
     }
+
+    // Recalculate normalized path if the URI was changed by script
+    let normalized_path = if script_outcome.request.uri_changed() {
+        match normalize_request_path(head.uri.path()) {
+            Some(path) => path,
+            None => {
+                // Invalid path after script modification
+                send_h2_bytes_response(
+                    &mut respond,
+                    StatusCode::BAD_REQUEST,
+                    "text/plain; charset=utf-8",
+                    b"Bad Request".to_vec(),
+                    head_only,
+                    &HashMap::new(),
+                )
+                .await?;
+                return Ok(());
+            }
+        }
+    } else {
+        normalized_path
+    };
 
     if let Some(proxy_url) = script_outcome.reverse_proxy {
         // Take body from state - may be None if script consumed it
@@ -897,7 +979,11 @@ async fn prepare_static_response(
     normalized_path: &NormalizedPath,
 ) -> Option<StaticResponse> {
     let site = shared.site.load_full();
-    let entry = site.lookup(normalized_path, &shared.config.index_file, shared.config.try_html)?;
+    let entry = site.lookup(
+        normalized_path,
+        &shared.config.index_file,
+        shared.config.try_html,
+    )?;
     let mime = guess_mime(&entry.path);
 
     if should_template_replace(mime, metadata) {
@@ -1019,7 +1105,8 @@ async fn serve_static(
     metadata: &HashMap<String, String>,
     normalized_path: &NormalizedPath,
 ) -> Option<()> {
-    let response = prepare_static_response(head, shared, head_only, metadata, normalized_path).await?;
+    let response =
+        prepare_static_response(head, shared, head_only, metadata, normalized_path).await?;
     send_static_response_h1(w, shared, peer, response, metadata).await;
     Some(())
 }
@@ -1032,10 +1119,11 @@ async fn serve_static_h2(
     metadata: &HashMap<String, String>,
     normalized_path: &NormalizedPath,
 ) -> Result<Option<()>> {
-    let response = match prepare_static_response(head, shared, head_only, metadata, normalized_path).await {
-        Some(response) => response,
-        None => return Ok(None),
-    };
+    let response =
+        match prepare_static_response(head, shared, head_only, metadata, normalized_path).await {
+            Some(response) => response,
+            None => return Ok(None),
+        };
     send_static_response_h2(respond, shared, response, metadata).await?;
     Ok(Some(()))
 }
@@ -2175,6 +2263,32 @@ fn text_response(status: StatusCode, body: &str) -> ::http::Response<Bytes> {
         .header(::http::header::CONTENT_TYPE, "text/plain; charset=utf-8")
         .body(Bytes::copy_from_slice(body.as_bytes()))
         .unwrap()
+}
+
+fn misdirected_request() -> ::http::Response<Bytes> {
+    text_response(StatusCode::MISDIRECTED_REQUEST, "Misdirected Request")
+}
+
+fn is_valid_hostname(host: &str, allowed: &[String]) -> bool {
+    if allowed.is_empty() {
+        return true;
+    }
+    // Strip port if present, handling IPv6 bracket notation
+    let host_without_port = if host.starts_with('[') {
+        // IPv6 literal: [::1] or [2001:db8::1]:8080
+        host.split("]:")
+            .next()
+            .map(|s| s.trim_start_matches('[').trim_end_matches(']'))
+            .unwrap_or(host)
+    } else {
+        // IPv4 or hostname: strip :port
+        host.split(':').next().unwrap_or(host)
+    };
+    // Case-insensitive comparison
+    let host_lower = host_without_port.to_ascii_lowercase();
+    allowed
+        .iter()
+        .any(|allowed| allowed.to_ascii_lowercase() == host_lower)
 }
 
 async fn log_request(

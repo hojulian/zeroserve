@@ -140,4 +140,8 @@ pub struct Cli {
     /// Maximum number of rate limit buckets (unique keys) to track.
     #[arg(long, default_value_t = 10000, value_parser = must_be_positive)]
     pub max_rate_limit_buckets: usize,
+
+    /// Comma-separated list of allowed hostnames. Requests with non-matching hostnames receive a 421 error.
+    #[arg(long, value_delimiter = ',')]
+    pub validate_hostnames: Vec<String>,
 }

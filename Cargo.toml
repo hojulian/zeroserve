@@ -9,7 +9,7 @@ panic = "abort"
 [dependencies]
 arc-swap = "1"
 chrono = "0.4"
-async-ebpf = "0.2.1"
+async-ebpf = "0.2.2"
 # async-ebpf = { path = "../async-ebpf" }
 base64ct = "1"
 dashmap = "6"

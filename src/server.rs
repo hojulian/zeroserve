@@ -645,11 +645,14 @@ where
 {
     let request_id = Ulid::new();
     let (parts, body) = request.into_parts();
+    let mut headers = parts.headers;
+    h1::normalize_cookie_headers(&mut headers);
+
     let mut head = RequestHead {
         method: parts.method,
         uri: parts.uri,
         version: ::http::Version::HTTP_2,
-        headers: parts.headers,
+        headers,
     };
     ensure_host_header(&mut head);
 

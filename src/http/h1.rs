@@ -506,6 +506,13 @@ pub async fn write_request_head(
     w: &mut impl AsyncWriteRent,
     head: &RequestHead,
 ) -> Result<(), HttpError> {
+    let buf = encode_request_head(head);
+    let (res, _) = w.write_all(buf).await;
+    res.map_err(HttpError::Io)?;
+    Ok(())
+}
+
+fn encode_request_head(head: &RequestHead) -> Vec<u8> {
     let mut buf = Vec::new();
     buf.extend_from_slice(head.method.as_str().as_bytes());
     buf.extend_from_slice(b" ");
@@ -513,16 +520,42 @@ pub async fn write_request_head(
     buf.extend_from_slice(b" ");
     buf.extend_from_slice(version_bytes(head.version));
     buf.extend_from_slice(b"\r\n");
+
     for (name, value) in head.headers.iter() {
-        buf.extend_from_slice(name.as_str().as_bytes());
-        buf.extend_from_slice(b": ");
-        buf.extend_from_slice(value.as_bytes());
-        buf.extend_from_slice(b"\r\n");
+        append_header_line(&mut buf, name, value);
     }
     buf.extend_from_slice(b"\r\n");
-    let (res, _) = w.write_all(buf).await;
-    res.map_err(HttpError::Io)?;
-    Ok(())
+    buf
+}
+
+pub fn normalize_cookie_headers(headers: &mut HeaderMap) {
+    let mut values = headers.get_all(header::COOKIE).iter();
+    let Some(first) = values.next() else {
+        return;
+    };
+    let Some(second) = values.next() else {
+        return;
+    };
+
+    let mut combined = Vec::new();
+    combined.extend_from_slice(first.as_bytes());
+    combined.extend_from_slice(b"; ");
+    combined.extend_from_slice(second.as_bytes());
+    for value in values {
+        combined.extend_from_slice(b"; ");
+        combined.extend_from_slice(value.as_bytes());
+    }
+
+    let value = HttpHeaderValue::from_bytes(&combined)
+        .expect("combined Cookie header should remain a valid header value");
+    headers.insert(header::COOKIE, value);
+}
+
+fn append_header_line(buf: &mut Vec<u8>, name: &HeaderName, value: &HttpHeaderValue) {
+    buf.extend_from_slice(name.as_str().as_bytes());
+    buf.extend_from_slice(b": ");
+    buf.extend_from_slice(value.as_bytes());
+    buf.extend_from_slice(b"\r\n");
 }
 
 pub async fn write_chunk(w: &mut impl AsyncWriteRent, data: &[u8]) -> Result<(), HttpError> {
@@ -570,7 +603,8 @@ fn parse_request_head(raw: &[u8]) -> Result<RequestHead, HttpError> {
         .parse()
         .map_err(|_| HttpError::InvalidRequest("invalid uri"))?;
     let version = parse_version(version).ok_or(HttpError::InvalidRequest("invalid version"))?;
-    let headers = parse_headers(lines)?;
+    let mut headers = parse_headers(lines)?;
+    normalize_cookie_headers(&mut headers);
 
     Ok(RequestHead {
         method,
@@ -641,5 +675,63 @@ fn version_bytes(version: Version) -> &'static [u8] {
     match version {
         Version::HTTP_10 => b"HTTP/1.0",
         _ => b"HTTP/1.1",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalize_cookie_headers_combines_repeated_values() {
+        let mut headers = HeaderMap::new();
+        headers.append(header::HOST, HttpHeaderValue::from_static("example.com"));
+        headers.append(header::COOKIE, HttpHeaderValue::from_static("a=1"));
+        headers.append(header::COOKIE, HttpHeaderValue::from_static("b=2"));
+        headers.append(header::ACCEPT, HttpHeaderValue::from_static("*/*"));
+
+        normalize_cookie_headers(&mut headers);
+
+        assert_eq!(
+            headers.get(header::COOKIE).and_then(|v| v.to_str().ok()),
+            Some("a=1; b=2")
+        );
+        assert_eq!(headers.get_all(header::COOKIE).iter().count(), 1);
+    }
+
+    #[test]
+    fn parse_request_head_combines_repeated_cookie_headers() {
+        let raw = b"GET / HTTP/1.1\r\nHost: example.com\r\nCookie: a=1\r\nCookie: b=2\r\n\r\n";
+        let head = parse_request_head(raw).unwrap();
+
+        assert_eq!(
+            head.headers
+                .get(header::COOKIE)
+                .and_then(|v| v.to_str().ok()),
+            Some("a=1; b=2")
+        );
+        assert_eq!(head.headers.get_all(header::COOKIE).iter().count(), 1);
+    }
+
+    #[test]
+    fn encode_request_head_keeps_repeated_non_cookie_headers_separate() {
+        let mut headers = HeaderMap::new();
+        headers.append(header::ACCEPT, HttpHeaderValue::from_static("text/plain"));
+        headers.append(
+            header::ACCEPT,
+            HttpHeaderValue::from_static("application/json"),
+        );
+
+        let head = RequestHead {
+            method: Method::GET,
+            uri: "/proxy".parse().unwrap(),
+            version: Version::HTTP_11,
+            headers,
+        };
+
+        let encoded = String::from_utf8(encode_request_head(&head)).unwrap();
+
+        assert!(encoded.contains("\r\naccept: text/plain\r\n"));
+        assert!(encoded.contains("\r\naccept: application/json\r\n"));
     }
 }

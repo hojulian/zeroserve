@@ -258,6 +258,49 @@ async function readUntil(
     }
 }
 
+async function startRawHeaderCaptureBackend(): Promise<{
+    url: string;
+    requestHead: Promise<string>;
+    close: () => Promise<void>;
+}> {
+    const listener = Deno.listen({ hostname: "127.0.0.1", port: 0 });
+    const port = (listener.addr as Deno.NetAddr).port;
+    let closed = false;
+
+    const requestHead = (async () => {
+        const conn = await listener.accept();
+        try {
+            const delimiter = encoder.encode("\r\n\r\n");
+            const { head } = await readUntil(conn, delimiter);
+            await writeAll(
+                conn,
+                encoder.encode(
+                    "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+                ),
+            );
+            return decoder.decode(head);
+        } finally {
+            conn.close();
+            if (!closed) {
+                closed = true;
+                listener.close();
+            }
+        }
+    })();
+
+    return {
+        url: `http://127.0.0.1:${port}`,
+        requestHead,
+        close: async () => {
+            if (!closed) {
+                closed = true;
+                listener.close();
+            }
+            await requestHead.catch(() => {});
+        },
+    };
+}
+
 async function readChunkedBody(
     conn: Deno.Conn,
     initial: ByteArray,
@@ -537,6 +580,81 @@ zs_u64 entry(void) {
             await withZeroserve(tarPath, async (baseUrl) => {
                 const wsUrl = `${baseUrl.replace("http://", "ws://")}/socket`;
                 await assertWebsocketEcho(wsUrl, "ping");
+            });
+        } finally {
+            await backend.close().catch(() => {});
+            if (tarPath) {
+                await Deno.remove(tarPath).catch(() => {});
+            }
+            await Deno.remove(siteDir, { recursive: true }).catch(() => {});
+        }
+    },
+});
+
+Deno.test({
+    name: "e2e: reverse proxy combines multiple cookie request headers",
+    ignore: !canRunScripts,
+    fn: async () => {
+        const backend = await startRawHeaderCaptureBackend();
+        const siteDir = await Deno.makeTempDir();
+        let tarPath: string | null = null;
+        try {
+            const scriptsDir = join(siteDir, ".zeroserve", "scripts");
+            await Deno.mkdir(scriptsDir, { recursive: true });
+
+            const scriptSource = `#include <zeroserve.h>
+
+ZS_ENTRY
+zs_u64 entry(void) {
+  zs_reverse_proxy(ZS_STR("${backend.url}"));
+  return 0;
+}
+`;
+            await Deno.writeTextFile(
+                join(scriptsDir, "18-cookie-proxy.c"),
+                scriptSource,
+            );
+
+            tarPath = await packSite(siteDir);
+
+            await withZeroserve(tarPath, async (baseUrl) => {
+                const url = new URL(baseUrl);
+                const hostname = url.hostname;
+                const port = Number(url.port);
+                const conn = await Deno.connect({ hostname, port });
+                try {
+                    const request = [
+                        "GET /cookies HTTP/1.1",
+                        `Host: ${hostname}:${port}`,
+                        "Cookie: theme=light",
+                        "Cookie: session=abc",
+                        "Accept: text/plain",
+                        "Connection: close",
+                        "",
+                        "",
+                    ].join("\r\n");
+                    await writeAll(conn, encoder.encode(request));
+                    const { head, rest } = await readUntil(
+                        conn,
+                        encoder.encode("\r\n\r\n"),
+                    );
+                    const responseHead = decoder.decode(head);
+                    assert(responseHead.startsWith("HTTP/1.1 200 "));
+                    const responseBody = await readContentLengthBody(
+                        conn,
+                        rest,
+                        2,
+                    );
+                    assertEquals(decoder.decode(responseBody), "ok");
+                } finally {
+                    conn.close();
+                }
+
+                const upstreamHead = await backend.requestHead;
+                const cookieLines = upstreamHead
+                    .split("\r\n")
+                    .filter((line) => line.toLowerCase().startsWith("cookie:"));
+                assertEquals(cookieLines, ["cookie: theme=light; session=abc"]);
             });
         } finally {
             await backend.close().catch(() => {});

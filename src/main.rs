@@ -1,5 +1,7 @@
+mod boringtls;
 mod cli;
 mod config;
+mod ech;
 mod helpers;
 mod http;
 mod hupwatch;
@@ -30,7 +32,6 @@ use clap::Parser;
 use landlock::{Access, AccessFs, PathBeneath, PathFd, Ruleset, RulesetAttr, RulesetCreatedAttr};
 use monoio::{IoUringDriver, RuntimeBuilder};
 use nix::mount::MsFlags;
-use rustls::crypto::aws_lc_rs;
 
 use crate::reload::SighupBlocked;
 use crate::{
@@ -50,15 +51,19 @@ pub const SERVER_HEADER: &str = "zeroserve";
 pub const DEFAULT_INDEX: &str = "index.html";
 
 fn main() -> Result<()> {
-    aws_lc_rs::default_provider()
-        .install_default()
-        .expect("failed to install aws-lc provider");
-
     let args = Cli::parse();
     if args.dump_sdk {
         let mut out = std::io::stdout().lock();
         out.write_all(ZEROSERVE_H)?;
         out.flush()?;
+        return Ok(());
+    }
+    if args.gen_ech_key {
+        let public_name = args
+            .ech_public_name
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("--gen-ech-key requires --ech-public-name"))?;
+        ech::keygen::run(public_name)?;
         return Ok(());
     }
     if let Some(pack_root) = args.pack.as_ref() {
@@ -81,6 +86,15 @@ fn main() -> Result<()> {
     } else {
         None
     };
+
+    // Build the reverse-proxy TLS client now, before namespace isolation turns
+    // /etc into an empty tmpfs — the CA bundle must be read while it's still on
+    // disk. Best-effort: HTTP proxying and serving still work without it; only
+    // HTTPS upstreams would fail.
+    match boringtls::init_client_from_system_roots() {
+        Ok(()) => {}
+        Err(err) => eprintln!("warning: {err}"),
+    }
 
     if !config.disable_ns_isolation {
         setup_ns_isolation(&config).with_context(
@@ -184,13 +198,28 @@ fn main() -> Result<()> {
         })
 }
 
-fn setup_landlock(_config: &StaticConfig) -> anyhow::Result<()> {
+fn setup_landlock(config: &StaticConfig) -> anyhow::Result<()> {
     let abi = landlock::ABI::V2;
     let access_read = AccessFs::ReadFile;
     let access_all = AccessFs::from_all(abi);
 
     let mut ruleset = Ruleset::default().handle_access(access_all)?.create()?;
     ruleset = ruleset.add_rule(PathBeneath::new(PathFd::new("/")?, access_read))?;
+
+    // The broad rule above grants ReadFile everywhere but not ReadDir. When
+    // --ech-key points at a directory we need to enumerate it (file-mode is
+    // already covered by ReadFile).
+    if let Some(ech_path) = &config.ech_key_path {
+        let meta = std::fs::metadata(ech_path)
+            .with_context(|| format!("stat ECH key path {}", ech_path.display()))?;
+        if meta.is_dir() {
+            ruleset = ruleset.add_rule(PathBeneath::new(
+                PathFd::new(ech_path)?,
+                AccessFs::ReadFile | AccessFs::ReadDir,
+            ))?;
+        }
+    }
+
     ruleset.restrict_self()?;
     Ok(())
 }

@@ -5,8 +5,8 @@ use std::{
 };
 
 use monoio::net::TcpStream;
-use monoio_rustls::ClientTlsStream;
 
+use crate::boringtls::BoringStream;
 use crate::http::h1::H1Connection;
 
 const MAX_POOL_PER_KEY: usize = 128;
@@ -31,7 +31,7 @@ impl PoolKey {
 
 pub enum PooledConnection {
     Http(H1Connection<TcpStream>),
-    Https(H1Connection<ClientTlsStream<TcpStream>>),
+    Https(H1Connection<BoringStream<TcpStream>>),
 }
 
 struct PoolEntry {

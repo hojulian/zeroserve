@@ -28,18 +28,18 @@ use monoio::{
     net::{TcpListener, TcpStream},
 };
 use monoio_compat::StreamWrapper;
-use monoio_rustls::{ClientTlsStream, TlsConnector, TlsError};
-use rustls::{ClientConfig, RootCertStore, pki_types::ServerName};
 use ulid::Ulid;
 use url::Url;
 
 use crate::{
+    boringtls::BoringStream,
     config::StaticConfig,
     http::h1::{self, HttpError, Request, RequestHead, StreamHint},
     logging::async_log,
     pool::{self, PoolKey, PooledConnection},
     script::{
-        BodyReadError, BodySource, ScriptOutcome, ScriptRequest, ScriptResponse, ScriptRuntime,
+        BodyReadError, BodySource, ConnectionInfo, ScriptOutcome, ScriptRequest, ScriptResponse,
+        ScriptRuntime,
     },
     shared::{SharedState, read_tar_entry, stream_tar_entry},
     site::{NormalizedPath, guess_mime, normalize_request_path},
@@ -213,11 +213,21 @@ async fn handle_http_connection(
     shared: Arc<SharedState>,
     script_runtime: Rc<ScriptRuntime>,
 ) -> Result<()> {
+    let conn = ConnectionInfo::default();
     if is_h2c_preface(&stream).await? {
-        return handle_h2c_connection(hup, stream, peer, shared, script_runtime).await;
+        return handle_h2c_connection(hup, stream, peer, shared, script_runtime, conn).await;
     }
 
-    handle_h1_connection(&mut hup, stream, peer, shared, Scheme::Http, script_runtime).await
+    handle_h1_connection(
+        &mut hup,
+        stream,
+        peer,
+        shared,
+        Scheme::Http,
+        script_runtime,
+        conn,
+    )
+    .await
 }
 
 async fn run_tls_listener(
@@ -267,9 +277,33 @@ async fn run_tls_listener(
                     return;
                 }
             };
+            // BoringSSL terminates ECH natively (inner-ClientHello decryption,
+            // ServerHello acceptance signal, retry_configs on rejection), so the
+            // listener just does a normal accept and reads the negotiated state.
             match tls_state.acceptor.accept(stream).await {
                 Ok(tls_stream) => {
-                    let is_h2 = matches!(tls_stream.alpn_protocol().as_deref(), Some(b"h2"));
+                    let alpn = tls_stream
+                        .alpn_protocol()
+                        .and_then(|p| String::from_utf8(p).ok());
+                    let is_h2 = matches!(alpn.as_deref(), Some("h2"));
+                    let ech_ok = tls_stream.ech_accepted();
+                    let ech_accepted = if tls_state.ech_enabled {
+                        Some(ech_ok)
+                    } else {
+                        None
+                    };
+                    let outer_sni = if ech_ok {
+                        tls_state.ech_public_name.clone()
+                    } else {
+                        None
+                    };
+                    let conn = ConnectionInfo {
+                        tls: true,
+                        alpn,
+                        inner_sni: tls_stream.server_name(),
+                        outer_sni,
+                        ech_accepted,
+                    };
                     if is_h2 {
                         let io = StreamWrapper::new(tls_stream);
                         if let Err(err) = handle_h2_connection(
@@ -279,6 +313,7 @@ async fn run_tls_listener(
                             state,
                             script_runtime,
                             Scheme::Https,
+                            conn,
                         )
                         .await
                         {
@@ -298,6 +333,7 @@ async fn run_tls_listener(
                         state,
                         Scheme::Https,
                         script_runtime,
+                        conn,
                     )
                     .await
                     {
@@ -311,16 +347,21 @@ async fn run_tls_listener(
                         .await;
                     }
                 }
-                Err(err) => log_tls_error(reported_peer, err),
+                Err(err) => log_tls_error(reported_peer, &err),
             }
         });
     }
 }
 
-fn log_tls_error(peer: std::net::SocketAddr, error: TlsError) {
-    if let TlsError::Io(x) = &error {
-        if x.kind() == ErrorKind::ConnectionReset || x.kind() == ErrorKind::UnexpectedEof {
-            return;
+fn log_tls_error(peer: std::net::SocketAddr, error: &anyhow::Error) {
+    // Suppress the routine peer-disconnect noise; surface real failures.
+    for cause in error.chain() {
+        if let Some(io_err) = cause.downcast_ref::<std::io::Error>() {
+            if io_err.kind() == ErrorKind::ConnectionReset
+                || io_err.kind() == ErrorKind::UnexpectedEof
+            {
+                return;
+            }
         }
     }
     eprintln!("TLS handshake with {peer} failed: {error:?}");
@@ -366,6 +407,7 @@ async fn handle_h1_connection<IO, H>(
     shared: Arc<SharedState>,
     scheme: Scheme,
     script_runtime: Rc<ScriptRuntime>,
+    connection: ConnectionInfo,
 ) -> Result<()>
 where
     IO: AsyncReadRent + AsyncWriteRent + Split + 'static,
@@ -403,6 +445,7 @@ where
             scheme,
             &mut w,
             hup,
+            &connection,
         )
         .await;
         reader = returned_reader;
@@ -419,11 +462,21 @@ async fn handle_h2c_connection(
     peer: std::net::SocketAddr,
     shared: Arc<SharedState>,
     script_runtime: Rc<ScriptRuntime>,
+    connection: ConnectionInfo,
 ) -> Result<()> {
     let io = stream
         .into_poll_io()
         .map_err(|err| anyhow!("failed to enable h2 poll-io: {err}"))?;
-    handle_h2_connection(hup, io, peer, shared, script_runtime, Scheme::Http).await
+    handle_h2_connection(
+        hup,
+        io,
+        peer,
+        shared,
+        script_runtime,
+        Scheme::Http,
+        connection,
+    )
+    .await
 }
 
 async fn handle_h2_connection<IO>(
@@ -433,6 +486,7 @@ async fn handle_h2_connection<IO>(
     shared: Arc<SharedState>,
     script_runtime: Rc<ScriptRuntime>,
     scheme: Scheme,
+    conn_info: ConnectionInfo,
 ) -> Result<()>
 where
     IO: monoio::io::poll_io::AsyncRead + monoio::io::poll_io::AsyncWrite + Unpin + 'static,
@@ -468,9 +522,19 @@ where
         let script_runtime = script_runtime.clone();
         let hup = hup.clone();
         let scheme = scheme;
+        let conn_for_request = conn_info.clone();
         monoio::spawn(async move {
-            if let Err(err) =
-                handle_h2_request(request, respond, state, script_runtime, peer, scheme, hup).await
+            if let Err(err) = handle_h2_request(
+                request,
+                respond,
+                state,
+                script_runtime,
+                peer,
+                scheme,
+                hup,
+                conn_for_request,
+            )
+            .await
             {
                 async_log(
                     format!("[h2] stream {} closed with error: {err:?}\n", peer).into_bytes(),
@@ -491,6 +555,7 @@ async fn handle_request<R: AsyncReadRent + 'static>(
     scheme: Scheme,
     w: &mut impl AsyncWriteRent,
     interrupt: &mut (impl Future<Output = ()> + Unpin),
+    connection: &ConnectionInfo,
 ) -> (bool, h1::H1Connection<R>) {
     let request_id = Ulid::new();
     let (mut head, body) = req.into_parts();
@@ -526,7 +591,14 @@ async fn handle_request<R: AsyncReadRent + 'static>(
         return (true, reader);
     };
 
-    let script_request = build_script_request(request_id, &head, peer, scheme, &normalized_path);
+    let script_request = build_script_request(
+        request_id,
+        &head,
+        peer,
+        scheme,
+        &normalized_path,
+        connection.clone(),
+    );
     let script_request_fallback = script_request.clone();
     let script_outcome = monoio::select! {
         x = script_runtime.run_request(shared.site.load_full(), script_request, body_source) => x,
@@ -639,6 +711,7 @@ async fn handle_h2_request<H>(
     peer: std::net::SocketAddr,
     scheme: Scheme,
     hup: future::Shared<H>,
+    connection: ConnectionInfo,
 ) -> Result<()>
 where
     H: Future<Output = ()> + Unpin + 'static,
@@ -700,7 +773,14 @@ where
         return Ok(());
     };
 
-    let script_request = build_script_request(request_id, &head, peer, scheme, &normalized_path);
+    let script_request = build_script_request(
+        request_id,
+        &head,
+        peer,
+        scheme,
+        &normalized_path,
+        connection,
+    );
     let script_request_fallback = script_request.clone();
     let mut hup_wait = hup.clone();
     let script_outcome = monoio::select! {
@@ -1323,6 +1403,7 @@ fn build_script_request(
     peer: std::net::SocketAddr,
     scheme: Scheme,
     normalized_path: &NormalizedPath,
+    connection: ConnectionInfo,
 ) -> ScriptRequest {
     let mut headers = HashMap::new();
     for (name, value) in head.headers.iter() {
@@ -1360,6 +1441,7 @@ fn build_script_request(
         peer: peer.to_string(),
         headers,
         query_params,
+        connection,
         uri_changed: false,
         header_changes: HashMap::new(),
     }
@@ -1632,16 +1714,8 @@ pub(crate) async fn connect_backend(target: &BackendTarget) -> Result<PooledConn
     }
 }
 
-async fn connect_tls(stream: TcpStream, host: &str) -> Result<ClientTlsStream<TcpStream>> {
-    let root_store = RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-    let config = ClientConfig::builder()
-        .with_root_certificates(root_store)
-        .with_no_client_auth();
-    let connector = TlsConnector::from(Arc::new(config));
-    let server_name =
-        ServerName::try_from(host.to_string()).map_err(|_| anyhow!("invalid TLS server name"))?;
-    connector
-        .connect(server_name, stream)
+async fn connect_tls(stream: TcpStream, host: &str) -> Result<BoringStream<TcpStream>> {
+    crate::boringtls::client_connect(stream, host)
         .await
         .map_err(|err| anyhow!("TLS handshake failed: {err}"))
 }

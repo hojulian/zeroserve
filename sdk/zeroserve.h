@@ -99,6 +99,28 @@ extern zs_s64 zs_req_set_uri(const char *uri, zs_u64 uri_len);
 extern zs_s64 zs_req_query(char *out, zs_u64 out_len);
 extern zs_s64 zs_req_scheme(char *out, zs_u64 out_len);
 extern zs_s64 zs_req_peer(char *out, zs_u64 out_len);
+
+/* Return a JSON object handle describing the current connection's transport
+ * state. Free with zs_object_free. The object has fields:
+ *   "tls"     (bool)         - true if served over TLS
+ *   "alpn"    (string|null)  - negotiated ALPN, e.g. "h2" / "http/1.1"
+ *   "sni"     (object)       - { "inner": string|null, "outer": string|null }
+ *   "ech"     (object|null)  - null when the server has no ECH keys loaded;
+ *                              otherwise { "accepted": bool }
+ *
+ * "sni.inner" is the server name being served: the real, protected name when
+ * ECH was accepted, or the cleartext SNI for plain TLS. "sni.outer" is the
+ * cleartext ECH public name when ECH was accepted (null for plain TLS or
+ * rejected ECH).
+ *
+ * "ech.accepted" is true when BoringSSL decrypted the client's Encrypted
+ * Client Hello (the real SNI is protected). false means ECH was not accepted
+ * on this connection (the client offered a stale/absent config and is being
+ * served against the public-name certificate). On rejection BoringSSL returns
+ * retry_configs to the client automatically.
+ */
+extern zs_s64 zs_connection_info(void);
+
 extern zs_s64 zs_req_header(const char *name, zs_u64 name_len, char *out,
                             zs_u64 out_len);
 extern zs_s64 zs_req_set_header(const char *name, zs_u64 name_len,
@@ -240,28 +262,36 @@ extern zs_s64 zs_rate_limit(const void *key, zs_u64 key_len, zs_u64 per_second,
  * verified against a JWKS.
  */
 
+/* All four helpers below return `-1` on configuration errors (bad `cfg`
+ * handle, missing client_id/redirect_uri, weak cookie_secret). `-1` is a
+ * normal return value — the script keeps running and is expected to decide
+ * what to do (e.g. respond 500, fall through to other middleware). The
+ * runtime logs the underlying reason to stderr. */
+
 /* Begin login: set the sealed state cookie and 302-redirect to the IdP.
  * `return_to` is stored and the user is sent back there after callback.
- * Terminal. Returns 0, or <0 on configuration error (the run then fails 500). */
+ * Terminal on success. Returns 0 on success, -1 on configuration error. */
 extern zs_s64 zs_oidc_begin_login(zs_s64 cfg, const char *return_to,
                                   zs_u64 return_to_len);
 
 /* Handle the IdP redirect: reads `code` and `state` from the current request,
  * validates state against the state cookie, exchanges the code (+PKCE verifier)
  * at the token endpoint, validates id_token claims, sets the sealed session
- * cookie, and 302-redirects to the stored return_to. Terminal. Returns 0; sets a
- * 400 on a bad/missing state and a 502 if the token exchange fails. */
+ * cookie, and 302-redirects to the stored return_to. Terminal on success.
+ * Returns 0 on success, -1 on configuration error. A bad/missing state sets a
+ * 400 and returns 0; a token-exchange failure sets a 502 and returns 0. */
 extern zs_s64 zs_oidc_handle_callback(zs_s64 cfg);
 
 /* Verify the session cookie on the current request. Returns a JSON object handle
  * of the identity claims (e.g. "sub", "email") on success, 0 if there is no
- * valid session, or <0 on internal error. NOT terminal: the script decides what
- * to do (e.g. call zs_oidc_begin_login when 0). Free the handle with
+ * valid session, or -1 on configuration error. NOT terminal: the script decides
+ * what to do (e.g. call zs_oidc_begin_login when 0). Free the handle with
  * zs_object_free. */
 extern zs_s64 zs_oidc_session_verify(zs_s64 cfg);
 
 /* Clear the session cookie. If `end_session_url` is non-empty, 302-redirect
- * there (e.g. the IdP end-session endpoint); otherwise respond 200. Terminal. */
+ * there (e.g. the IdP end-session endpoint); otherwise respond 200. Terminal
+ * on success. Returns 0 on success, -1 on configuration error. */
 extern zs_s64 zs_oidc_logout(zs_s64 cfg, const char *end_session_url,
                              zs_u64 end_session_url_len);
 

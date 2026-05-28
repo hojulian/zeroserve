@@ -27,45 +27,53 @@ fn opt_string(scope: &HelperScope, ptr: u64, len: u64) -> Result<Option<String>,
 /// keys: `issuer`, `authorization_endpoint`, `token_endpoint`, `client_id`,
 /// `client_secret`, `redirect_uri`, `scope`, `cookie_secret`,
 /// `session_ttl_secs`.
-fn read_config(scope: &HelperScope, cfg_handle: u64) -> Result<OidcConfig, ()> {
+///
+/// Returns `Ok(None)` when the handle does not resolve to a JSON object —
+/// callers should surface that as a configuration error (`-1`) rather than a
+/// hard script abort.
+fn read_config(scope: &HelperScope, cfg_handle: u64) -> Result<Option<OidcConfig>, ()> {
     with_ectx(scope, |ctx| {
         let json = ctx.extobj::<JsonRef>(cfg_handle)?;
-        let cfg = json
-            .view(|v| {
-                let obj = v.as_object()?;
-                let s = |k: &str| obj.get(k).and_then(|x| x.as_str()).map(str::to_string);
-                Some(OidcConfig {
-                    issuer: s("issuer"),
-                    authorization_endpoint: s("authorization_endpoint"),
-                    token_endpoint: s("token_endpoint"),
-                    client_id: s("client_id").unwrap_or_default(),
-                    client_secret: s("client_secret").unwrap_or_default(),
-                    redirect_uri: s("redirect_uri").unwrap_or_default(),
-                    scope: s("scope").unwrap_or_else(|| DEFAULT_SCOPE.to_string()),
-                    cookie_secret: s("cookie_secret").unwrap_or_default().into_bytes(),
-                    session_ttl_secs: obj
-                        .get("session_ttl_secs")
-                        .and_then(|x| x.as_u64())
-                        .filter(|n| *n > 0)
-                        .unwrap_or(DEFAULT_SESSION_TTL_SECS),
-                })
+        json.view(|v| {
+            let obj = v.as_object()?;
+            let s = |k: &str| obj.get(k).and_then(|x| x.as_str()).map(str::to_string);
+            Some(OidcConfig {
+                issuer: s("issuer"),
+                authorization_endpoint: s("authorization_endpoint"),
+                token_endpoint: s("token_endpoint"),
+                client_id: s("client_id").unwrap_or_default(),
+                client_secret: s("client_secret").unwrap_or_default(),
+                redirect_uri: s("redirect_uri").unwrap_or_default(),
+                scope: s("scope").unwrap_or_else(|| DEFAULT_SCOPE.to_string()),
+                cookie_secret: s("cookie_secret").unwrap_or_default().into_bytes(),
+                session_ttl_secs: obj
+                    .get("session_ttl_secs")
+                    .and_then(|x| x.as_u64())
+                    .filter(|n| *n > 0)
+                    .unwrap_or(DEFAULT_SESSION_TTL_SECS),
             })
-            .map_err(|_| ())?;
-        cfg.ok_or_else(|| {
-            ctx.error = "oidc config handle is not a JSON object".into();
         })
+        .map_err(|_| ())
     })
 }
 
-fn set_ctx_error(scope: &HelperScope, msg: impl Into<String>) -> Result<u64, ()> {
-    with_ectx(scope, |ctx| {
-        ctx.error = msg.into();
-        Err(())
-    })
+/// Log an OIDC configuration error and return `-1` to the script. The script
+/// can decide how to react (respond 500 itself, fall through to other
+/// middleware, etc.) instead of the runtime hard-aborting the request.
+/// `ctx.error` is intentionally NOT touched — that channel is reserved for
+/// fatal helper failures (the `Err(())` path).
+fn config_error_code(_scope: &HelperScope, msg: impl AsRef<str>) -> Result<u64, ()> {
+    eprintln!("[oidc] {}", msg.as_ref());
+    Ok(-1i64 as u64)
 }
 
 /// Set a terminal response on the execution context.
-fn respond(ctx: &mut crate::script::ScriptExecutionContext, status: u16, body: &str, headers: Vec<(String, String)>) {
+fn respond(
+    ctx: &mut crate::script::ScriptExecutionContext,
+    status: u16,
+    body: &str,
+    headers: Vec<(String, String)>,
+) {
     ctx.response = Some(ScriptResponse {
         status,
         body: body.as_bytes().to_vec(),
@@ -85,9 +93,17 @@ pub fn h_oidc_begin_login(
     _: u64,
     _: u64,
 ) -> Result<u64, ()> {
-    let cfg = read_config(scope, cfg_handle)?;
+    let Some(cfg) = read_config(scope, cfg_handle)? else {
+        return config_error_code(
+            scope,
+            "zs_oidc_begin_login: cfg handle is not a JSON object",
+        );
+    };
     if cfg.client_id.is_empty() || cfg.redirect_uri.is_empty() || cfg.cookie_secret.len() < 16 {
-        return set_ctx_error(scope, "zs_oidc_begin_login: missing client_id/redirect_uri or weak cookie_secret");
+        return config_error_code(
+            scope,
+            "zs_oidc_begin_login: missing client_id/redirect_uri or weak cookie_secret",
+        );
     }
     let return_to = opt_string(scope, return_to_ptr, return_to_len)?
         .filter(|s| !s.is_empty())
@@ -150,9 +166,17 @@ pub fn h_oidc_handle_callback(
     _: u64,
     _: u64,
 ) -> Result<u64, ()> {
-    let cfg = read_config(scope, cfg_handle)?;
+    let Some(cfg) = read_config(scope, cfg_handle)? else {
+        return config_error_code(
+            scope,
+            "zs_oidc_handle_callback: cfg handle is not a JSON object",
+        );
+    };
     if cfg.client_id.is_empty() || cfg.redirect_uri.is_empty() || cfg.cookie_secret.len() < 16 {
-        return set_ctx_error(scope, "zs_oidc_handle_callback: missing client_id/redirect_uri or weak cookie_secret");
+        return config_error_code(
+            scope,
+            "zs_oidc_handle_callback: missing client_id/redirect_uri or weak cookie_secret",
+        );
     }
 
     // Pull request-scoped inputs synchronously.
@@ -224,7 +248,10 @@ pub fn h_oidc_handle_callback(
                             "set-cookie".into(),
                             oidc::set_cookie(SESSION_COOKIE, &sealed, Some(ttl), secure),
                         ),
-                        ("set-cookie".into(), oidc::clear_cookie(STATE_COOKIE, secure)),
+                        (
+                            "set-cookie".into(),
+                            oidc::clear_cookie(STATE_COOKIE, secure),
+                        ),
                     ],
                 );
                 Ok(0)
@@ -251,9 +278,14 @@ pub fn h_oidc_session_verify(
     _: u64,
     _: u64,
 ) -> Result<u64, ()> {
-    let cfg = read_config(scope, cfg_handle)?;
+    let Some(cfg) = read_config(scope, cfg_handle)? else {
+        return config_error_code(
+            scope,
+            "zs_oidc_session_verify: cfg handle is not a JSON object",
+        );
+    };
     if cfg.cookie_secret.len() < 16 {
-        return set_ctx_error(scope, "zs_oidc_session_verify: weak cookie_secret");
+        return config_error_code(scope, "zs_oidc_session_verify: weak cookie_secret");
     }
 
     with_ectx(scope, |ctx| {
@@ -283,9 +315,11 @@ pub fn h_oidc_logout(
     _: u64,
 ) -> Result<u64, ()> {
     // Validate the config struct shape even though logout only clears the cookie.
-    let _ = read_config(scope, cfg_handle)?;
-    let end_session_url = opt_string(scope, end_session_ptr, end_session_len)?
-        .filter(|s| !s.is_empty());
+    if read_config(scope, cfg_handle)?.is_none() {
+        return config_error_code(scope, "zs_oidc_logout: cfg handle is not a JSON object");
+    }
+    let end_session_url =
+        opt_string(scope, end_session_ptr, end_session_len)?.filter(|s| !s.is_empty());
 
     with_ectx(scope, |ctx| {
         let secure = ctx.request.scheme == "https";

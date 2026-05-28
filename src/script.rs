@@ -140,6 +140,7 @@ static SCRIPT_HELPERS: &[(&str, Helper)] = &[
     ("zs_req_query", helpers::h_req_query),
     ("zs_req_scheme", helpers::h_req_scheme),
     ("zs_req_peer", helpers::h_req_peer),
+    ("zs_connection_info", helpers::h_connection_info),
     ("zs_req_header", helpers::h_req_header),
     ("zs_req_set_header", helpers::h_req_set_header),
     ("zs_req_query_param", helpers::h_req_query_param),
@@ -162,6 +163,31 @@ static SCRIPT_HELPERS: &[(&str, Helper)] = &[
 
 static HELPER_TABLES: &[&[(&str, Helper)]] = &[SCRIPT_HELPERS];
 
+/// Observed state of the underlying connection at the moment the request
+/// arrived. Exposed to scripts via `zs_connection_info` so they can react to
+/// TLS / ECH posture without re-parsing transport-layer details.
+#[derive(Clone, Debug, Default)]
+pub struct ConnectionInfo {
+    /// True when the request was received over TLS.
+    pub tls: bool,
+    /// Negotiated ALPN protocol (e.g. "h2", "http/1.1"). `None` when ALPN
+    /// was not used or the connection is plaintext.
+    pub alpn: Option<String>,
+    /// The server name BoringSSL is serving: the inner (real, protected) SNI
+    /// when ECH was accepted, otherwise the cleartext SNI. `None` if the
+    /// client sent no SNI or the connection is plaintext.
+    pub inner_sni: Option<String>,
+    /// The cleartext outer SNI — the ECH public name — when ECH was accepted
+    /// on this connection. `None` for plain TLS, rejected ECH, or when the
+    /// configured public name is ambiguous.
+    pub outer_sni: Option<String>,
+    /// `None` when the server has no ECH keys loaded; otherwise whether
+    /// BoringSSL accepted ECH on this connection (decrypted the inner
+    /// ClientHello). `Some(false)` covers both "client offered a stale/no
+    /// config" and "client did not offer ECH".
+    pub ech_accepted: Option<bool>,
+}
+
 #[derive(Clone, Debug)]
 pub struct ScriptRequest {
     pub request_id: Ulid,
@@ -173,6 +199,7 @@ pub struct ScriptRequest {
     pub peer: String,
     pub headers: HashMap<String, String>,
     pub query_params: HashMap<String, String>,
+    pub connection: ConnectionInfo,
     pub(crate) uri_changed: bool,
     pub(crate) header_changes: HashMap<String, Option<String>>,
 }

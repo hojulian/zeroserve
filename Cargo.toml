@@ -19,11 +19,10 @@ caps = "0.5"
 faster-hex = "0.10"
 futures = "0.3"
 h2 = "0.4"
-monoio = { version = "0.2", default-features = false, features = ["async-cancel", "bytes", "iouring", "poll-io", "utils", "sync"] }
+monoio = { version = "0.2", default-features = false, features = ["async-cancel", "bytes", "iouring", "poll-io", "utils", "sync", "macros"] }
 monoio-compat = "0.2"
-monoio-rustls = { version = "0.4" }
+boring = "5"
 clap = { version = "4", features = ["derive"] }
-rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "logging", "aws_lc_rs"] }
 anyhow = "1"
 hmac = "0.12"
 http = "1"
@@ -44,7 +43,6 @@ socket2 = { version = "0.5", features = ["all"] }
 struson = { version = "0.6", features = ["serde"] }
 ulid = "1"
 url = "2"
-webpki-roots = "0.26"
 moka = { version = "0.12", features = ["future"] }
 tar = "0.4"
 chacha20poly1305 = "0.10"

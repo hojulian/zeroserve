@@ -10,6 +10,7 @@ pub struct StaticConfig {
     pub tar_path: PathBuf,
     pub cert_path: Option<PathBuf>,
     pub key_path: Option<PathBuf>,
+    pub ech_key_path: Option<PathBuf>,
     pub reload_signal_file: Option<PathBuf>,
     pub index_file: String,
     pub chunk_size: usize,
@@ -50,6 +51,18 @@ impl TryFrom<Cli> for StaticConfig {
             (None, None, None)
         };
 
+        let ech_key_path = match cli.ech_key {
+            Some(path) => {
+                if !tls_requested {
+                    return Err(anyhow!(
+                        "--ech-key requires TLS to be enabled (provide --tls-addr, --cert, --key)"
+                    ));
+                }
+                Some(path)
+            }
+            None => None,
+        };
+
         let index_file = if cli.index.is_empty() {
             crate::DEFAULT_INDEX.to_string()
         } else {
@@ -66,6 +79,7 @@ impl TryFrom<Cli> for StaticConfig {
             tar_path,
             cert_path,
             key_path,
+            ech_key_path,
             reload_signal_file: cli.reload_signal_file,
             index_file,
             chunk_size: cli.chunk_size.max(1024),

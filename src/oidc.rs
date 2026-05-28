@@ -111,7 +111,13 @@ pub fn seal(secret: &[u8], aad: &[u8], plaintext: &[u8]) -> Result<String> {
     rand::thread_rng().fill_bytes(&mut nonce_bytes);
     let nonce = XNonce::from_slice(&nonce_bytes);
     let ciphertext = cipher
-        .encrypt(nonce, Payload { msg: plaintext, aad })
+        .encrypt(
+            nonce,
+            Payload {
+                msg: plaintext,
+                aad,
+            },
+        )
         .map_err(|_| anyhow!("seal failed"))?;
     let mut combined = Vec::with_capacity(XNONCE_LEN + ciphertext.len());
     combined.extend_from_slice(&nonce_bytes);
@@ -129,7 +135,13 @@ pub fn open(secret: &[u8], aad: &[u8], token: &str) -> Option<Vec<u8>> {
     let cipher = cipher(secret).ok()?;
     let nonce = XNonce::from_slice(nonce_bytes);
     cipher
-        .decrypt(nonce, Payload { msg: ciphertext, aad })
+        .decrypt(
+            nonce,
+            Payload {
+                msg: ciphertext,
+                aad,
+            },
+        )
         .ok()
 }
 
@@ -233,8 +245,8 @@ pub fn build_authorize_url(
     cfg: &OidcConfig,
     p: &LoginParams,
 ) -> Result<String> {
-    let mut url =
-        Url::parse(authorization_endpoint).map_err(|e| anyhow!("invalid authorize endpoint: {e}"))?;
+    let mut url = Url::parse(authorization_endpoint)
+        .map_err(|e| anyhow!("invalid authorize endpoint: {e}"))?;
     url.query_pairs_mut()
         .append_pair("response_type", "code")
         .append_pair("client_id", &cfg.client_id)
@@ -279,9 +291,7 @@ pub fn validate_claims(
 
     let aud_ok = match claims.get("aud") {
         Some(serde_json::Value::String(s)) => s == client_id,
-        Some(serde_json::Value::Array(arr)) => {
-            arr.iter().any(|v| v.as_str() == Some(client_id))
-        }
+        Some(serde_json::Value::Array(arr)) => arr.iter().any(|v| v.as_str() == Some(client_id)),
         _ => false,
     };
     if !aud_ok {
@@ -333,7 +343,8 @@ fn origin_form_uri(t: &BackendTarget) -> Result<http::Uri> {
         Some(q) if !q.is_empty() => format!("{path}?{q}"),
         _ => path.to_string(),
     };
-    raw.parse().map_err(|e| anyhow!("invalid endpoint path: {e}"))
+    raw.parse()
+        .map_err(|e| anyhow!("invalid endpoint path: {e}"))
 }
 
 async fn run_over<IO: AsyncReadRent + AsyncWriteRent>(
@@ -460,8 +471,8 @@ pub async fn exchange_code(
         ("code_verifier", code_verifier),
     ];
     let (status, body) = request(token_endpoint, &form, None).await?;
-    let parsed: TokenResponse =
-        serde_json::from_slice(&body).map_err(|e| anyhow!("token endpoint returned non-JSON: {e}"))?;
+    let parsed: TokenResponse = serde_json::from_slice(&body)
+        .map_err(|e| anyhow!("token endpoint returned non-JSON: {e}"))?;
     if status >= 400 || parsed.error.is_some() {
         bail!(
             "token endpoint error (status {status}): {} {}",
@@ -472,8 +483,7 @@ pub async fn exchange_code(
     let id_token = parsed
         .id_token
         .ok_or_else(|| anyhow!("token response missing id_token"))?;
-    let claims =
-        parse_id_token_claims(&id_token).ok_or_else(|| anyhow!("malformed id_token"))?;
+    let claims = parse_id_token_claims(&id_token).ok_or_else(|| anyhow!("malformed id_token"))?;
     validate_claims(
         &claims,
         cfg.issuer.as_deref(),
@@ -503,9 +513,7 @@ const DISCOVERY_TTL: Duration = Duration::from_secs(3600);
 /// Resolve the IdP endpoints, preferring explicit config and falling back to
 /// OIDC discovery against `{issuer}/.well-known/openid-configuration`.
 pub async fn resolve_endpoints(cfg: &OidcConfig) -> Result<Endpoints> {
-    if let (Some(auth), Some(token)) =
-        (&cfg.authorization_endpoint, &cfg.token_endpoint)
-    {
+    if let (Some(auth), Some(token)) = (&cfg.authorization_endpoint, &cfg.token_endpoint) {
         return Ok(Endpoints {
             authorization_endpoint: auth.clone(),
             token_endpoint: token.clone(),
@@ -518,9 +526,9 @@ pub async fn resolve_endpoints(cfg: &OidcConfig) -> Result<Endpoints> {
         .ok_or_else(|| anyhow!("oidc config needs either explicit endpoints or an issuer"))?;
 
     if let Some(found) = DISCOVERY_CACHE.with(|c| {
-        c.borrow().get(issuer).and_then(|(at, ep)| {
-            (at.elapsed() < DISCOVERY_TTL).then(|| ep.clone())
-        })
+        c.borrow()
+            .get(issuer)
+            .and_then(|(at, ep)| (at.elapsed() < DISCOVERY_TTL).then(|| ep.clone()))
     }) {
         return Ok(found);
     }
@@ -674,7 +682,15 @@ mod tests {
             c
         }))
         .unwrap();
-        assert!(validate_claims(&wrong_aud, Some("https://idp.example"), "client-123", "NONCE").is_err());
+        assert!(
+            validate_claims(
+                &wrong_aud,
+                Some("https://idp.example"),
+                "client-123",
+                "NONCE"
+            )
+            .is_err()
+        );
 
         let expired = parse_id_token_claims(&make_id_token({
             let mut c = base.clone();
@@ -682,13 +698,31 @@ mod tests {
             c
         }))
         .unwrap();
-        assert!(validate_claims(&expired, Some("https://idp.example"), "client-123", "NONCE").is_err());
+        assert!(
+            validate_claims(&expired, Some("https://idp.example"), "client-123", "NONCE").is_err()
+        );
 
         let bad_nonce = parse_id_token_claims(&make_id_token(base.clone())).unwrap();
-        assert!(validate_claims(&bad_nonce, Some("https://idp.example"), "client-123", "OTHER").is_err());
+        assert!(
+            validate_claims(
+                &bad_nonce,
+                Some("https://idp.example"),
+                "client-123",
+                "OTHER"
+            )
+            .is_err()
+        );
 
         let wrong_iss = parse_id_token_claims(&make_id_token(base)).unwrap();
-        assert!(validate_claims(&wrong_iss, Some("https://evil.example"), "client-123", "NONCE").is_err());
+        assert!(
+            validate_claims(
+                &wrong_iss,
+                Some("https://evil.example"),
+                "client-123",
+                "NONCE"
+            )
+            .is_err()
+        );
     }
 
     #[test]

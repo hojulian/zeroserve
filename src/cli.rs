@@ -89,10 +89,27 @@ pub struct Cli {
     #[arg(long, conflicts_with_all = ["pack", "tarball"])]
     pub dump_sdk: bool,
 
+    /// Generate a new ECH (Encrypted Client Hello) keypair and ECHConfig and
+    /// print them to stdout (PEM bundle) and stderr (DNS guidance).
+    /// Requires --ech-public-name.
+    #[arg(long, conflicts_with_all = ["pack", "tarball", "dump_sdk"])]
+    pub gen_ech_key: bool,
+
+    /// Public name to embed in the generated ECHConfig. The TLS cert served
+    /// by the runtime must cover this name. Only meaningful with --gen-ech-key.
+    #[arg(long, value_name = "NAME", requires = "gen_ech_key")]
+    pub ech_public_name: Option<String>,
+
+    /// Path to an ECH key file or directory of ECH key files. Each file is a
+    /// PEM bundle containing one or more (`BEGIN ECH PRIVATE KEY`,
+    /// `BEGIN ECH CONFIG`) pairs. Requires TLS to be configured.
+    #[arg(long, value_name = "PATH")]
+    pub ech_key: Option<PathBuf>,
+
     /// Path to the site tarball.
     #[arg(
         value_name = "SITE_TAR",
-        required_unless_present_any = ["pack", "dump_sdk"],
+        required_unless_present_any = ["pack", "dump_sdk", "gen_ech_key"],
         conflicts_with = "pack"
     )]
     pub tarball: Option<PathBuf>,

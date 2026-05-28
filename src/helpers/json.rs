@@ -86,6 +86,59 @@ pub fn h_load_file_metadata(
     })
 }
 
+/// Return a JSON object describing the current connection's transport state:
+///
+/// ```json
+/// {
+///   "tls": true,
+///   "alpn": "h2",
+///   "sni": { "inner": "secret.internal", "outer": "public.example.com" },
+///   "ech": { "accepted": true }
+/// }
+/// ```
+///
+/// Fields:
+/// - `tls`        — `true` when the request arrived over TLS.
+/// - `alpn`       — negotiated ALPN protocol, or `null` if ALPN was not used.
+/// - `sni`        — `{ "inner": string|null, "outer": string|null }`.
+///     - `inner` is the server name BoringSSL is serving: the real, protected
+///       name when ECH was accepted; the cleartext SNI for plain TLS.
+///     - `outer` is the cleartext ECH public name when ECH was accepted on
+///       this connection; `null` for plain TLS or rejected ECH.
+/// - `ech`        — `null` when the server has no ECH keys loaded; otherwise an
+///   object with `accepted` (bool): `true` means BoringSSL decrypted the inner
+///   ClientHello and the real SNI is protected; `false` means ECH was not
+///   accepted on this connection (client offered a stale/absent config and is
+///   being served against the public-name certificate).
+pub fn h_connection_info(
+    scope: &async_ebpf::program::HelperScope,
+    _: u64,
+    _: u64,
+    _: u64,
+    _: u64,
+    _: u64,
+) -> Result<u64, ()> {
+    with_ectx(scope, |ctx| {
+        let conn = &ctx.request.connection;
+        let ech = match conn.ech_accepted {
+            Some(accepted) => serde_json::json!({ "accepted": accepted }),
+            None => serde_json::Value::Null,
+        };
+        let json = serde_json::json!({
+            "tls": conn.tls,
+            "alpn": conn.alpn,
+            "sni": {
+                "inner": conn.inner_sni,
+                "outer": conn.outer_sni,
+            },
+            "ech": ech,
+        });
+        ctx.alloc_memory_footprint(estimate_json_memory_usage(&json) as u64)?;
+        let r = JsonRef::new(json);
+        ctx.alloc_extobj(r)
+    })
+}
+
 pub fn h_json_reset(
     scope: &async_ebpf::program::HelperScope,
     idx: u64,

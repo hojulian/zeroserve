@@ -543,6 +543,44 @@ Deno.test({
 });
 
 Deno.test({
+    name: "e2e: zs_connection_info reports tls/alpn/ech",
+    ignore: !canRunScripts,
+    fn: async () => {
+        const siteDir = await Deno.makeTempDir();
+        let tarPath: string | null = null;
+        try {
+            await Deno.writeTextFile(join(siteDir, "index.html"), "hello\n");
+            const scriptsDir = join(siteDir, ".zeroserve", "scripts");
+            await Deno.mkdir(scriptsDir, { recursive: true });
+            await Deno.copyFile(
+                join(repoRoot, "examples", "connection_info.c"),
+                join(scriptsDir, "connection_info.c"),
+            );
+            tarPath = await packSite(siteDir);
+
+            await withZeroserve(tarPath, async (baseUrl) => {
+                const res = await fetch(`${baseUrl}/conn`);
+                assertEquals(res.status, 200);
+                const body = (await res.json()) as {
+                    tls: boolean;
+                    alpn: string | null;
+                    sni: { inner: string | null; outer: string | null };
+                    ech: unknown;
+                };
+                assertEquals(body.tls, false);
+                assertEquals(body.alpn, null);
+                assertEquals(body.sni.inner, null);
+                assertEquals(body.sni.outer, null);
+                assertEquals(body.ech, null);
+            });
+        } finally {
+            if (tarPath) await Deno.remove(tarPath).catch(() => {});
+            await Deno.remove(siteDir, { recursive: true }).catch(() => {});
+        }
+    },
+});
+
+Deno.test({
     name: "e2e: websocket reverse proxy",
     ignore: !canRunScripts,
     fn: async () => {

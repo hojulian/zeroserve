@@ -65,6 +65,13 @@ Key options:
   Accepts either `ip:port` or `fd:N`.
 - `--cert <FILE>`: TLS certificate PEM.
 - `--key <FILE>`: TLS private key PEM.
+- `--ech-key <PATH>`: Path to an ECH key PEM file or directory of files.
+  Requires TLS to be configured. See the ECH section below.
+- `--gen-ech-key`: Generate a new ECH keypair and ECHConfig. Writes the PEM
+  bundle to stdout and a base64 ECHConfigList to stderr. Requires
+  `--ech-public-name`.
+- `--ech-public-name <NAME>`: Public DNS name to embed in a generated
+  ECHConfig (used only with `--gen-ech-key`).
 - `--index <NAME>`: Default document for directories (default `index.html`).
 - `--try-html`: Try `<path>.html` when a request path is missing.
 - `--chunk-size <BYTES>`: Streaming chunk size for tar reads (default 65536).
@@ -137,6 +144,69 @@ zeroserve --tls-addr 0.0.0.0:8443 --cert certificate.pem --key key.pem site.tar
 ```
 
 Reloading TLS assets uses the same hot-reload mechanism as the tarball.
+
+## Encrypted Client Hello (ECH)
+
+Zeroserve terminates TLS with BoringSSL, which has native server-side support
+for Encrypted Client Hello (draft-ietf-tls-esni / RFC 9460 HTTPS resource
+records), so the inner SNI — the real hostname a client is reaching — never
+appears in cleartext on the wire. The on-path observer only sees the public
+"client-facing" name.
+
+### Generate a keypair
+
+```bash
+zeroserve --gen-ech-key --ech-public-name www.example.com > ech.pem
+```
+
+`--gen-ech-key` writes a PEM bundle (one `ECH PRIVATE KEY` block and one
+`ECH CONFIG` block) to stdout and prints a base64-encoded `ECHConfigList`
+to stderr for publication. Put the printed value in the `ech=` parameter of
+the destination's HTTPS DNS resource record. The TLS certificate served by
+zeroserve must cover the chosen public name (its SAN must include
+`www.example.com`).
+
+### Run with ECH enabled
+
+```bash
+zeroserve --tls-addr 0.0.0.0:8443 --cert certificate.pem --key key.pem \
+  --ech-key ech.pem site.tar
+```
+
+`--ech-key` accepts either a single PEM file (one or more `ECH PRIVATE KEY`
+/ `ECH CONFIG` pairs concatenated) **or** a directory containing one or more
+such files. Directory mode is convenient for rotation: drop a new key file
+into the directory and send `SIGHUP` to load it alongside the existing keys.
+Files starting with `.` are ignored; entries are loaded in sorted-filename
+order; `config_id` collisions across pairs are rejected.
+
+When ECH is enabled the server logs the combined `ech=` value and the list
+of public names on startup and on each reload.
+
+### Rotation
+
+To rotate without downtime, generate a new pair and add it to the
+`--ech-key` directory:
+
+```bash
+zeroserve --gen-ech-key --ech-public-name www.example.com > keys/02.pem
+killall -SIGHUP zeroserve
+```
+
+Both old and new `ech=` values continue to decrypt successfully until the
+old file is removed. Update the DNS HTTPS record with the new ECHConfigList
+printed at reload, then after the DNS TTL has expired you can delete the
+old key file and SIGHUP again.
+
+### Reject behaviour
+
+When a client offers an ECH extension whose `config_id` doesn't match any
+loaded key, or when HPKE decryption fails, BoringSSL completes the handshake
+against the **public-name** certificate and returns the current `retry_configs`
+(every loaded ECHConfig) in the EncryptedExtensions. An ECH-aware client can
+then retry immediately with a fresh config, so a stale DNS cache self-heals
+within one extra handshake. Scripts can observe per-connection ECH status via
+`zs_connection_info()` (the `ech.accepted` field).
 
 ## Request scripting (eBPF)
 
@@ -377,6 +447,12 @@ Request inspection:
 - `zs_req_header(name, name_len, out, out_len)`
 - `zs_req_query_param(name, name_len, out, out_len)`
 - `zs_req_body_json()` parses the request body as JSON and returns a handle (-1 on failure).
+- `zs_connection_info()` returns a JSON object handle describing the
+  underlying connection: `{ "tls": bool, "alpn": string|null, "sni": {
+  "inner": string|null, "outer": string|null }, "ech": null | { "accepted":
+  bool } }`. `sni.inner` is the real (protected) server name when ECH was
+  accepted, else the cleartext SNI; `sni.outer` is the ECH public name when
+  ECH was accepted. Free with `zs_object_free`.
 
 Request mutation:
 

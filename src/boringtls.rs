@@ -14,6 +14,7 @@ use std::io::{self, Read, Write};
 use std::sync::OnceLock;
 
 use anyhow::{Context, Result, anyhow};
+use boring::ex_data::Index;
 use boring::ssl::{
     AlpnError, ErrorCode, HandshakeError, Ssl, SslConnector, SslContext, SslContextBuilder,
     SslFiletype, SslMethod, SslStream, SslStreamBuilder, select_next_proto,
@@ -24,9 +25,12 @@ use monoio::{
     io::{AsyncReadRent, AsyncWriteRent, AsyncWriteRentExt},
 };
 
+use crate::ja4;
+
 const READ_CHUNK: usize = 16 * 1024;
 // Wire-format ALPN list the server offers, in preference order: h2, http/1.1.
 const ALPN_WIRE: &[u8] = b"\x02h2\x08http/1.1";
+static JA4_EX_INDEX: OnceLock<Index<Ssl, String>> = OnceLock::new();
 
 /// In-memory bridge that boring's `SslStream<S>` reads/writes synchronously.
 /// `inbound` holds ciphertext received from the peer that the SSL state machine
@@ -100,6 +104,14 @@ impl BoringAcceptor {
             .context("certificate/key mismatch")?;
         builder.set_alpn_select_callback(|_ssl, client| {
             select_next_proto(ALPN_WIRE, client).ok_or(AlpnError::NOACK)
+        });
+        builder.set_select_certificate_callback(|mut client_hello| {
+            if let Some(fingerprint) = ja4::tls_client_fingerprint(client_hello.as_bytes()) {
+                client_hello
+                    .ssl_mut()
+                    .set_ex_data(ja4_ex_index(), fingerprint);
+            }
+            Ok(())
         });
         configure(&mut builder)?;
         Ok(Self {
@@ -282,6 +294,15 @@ impl<IO> BoringStream<IO> {
             .servername(boring::ssl::NameType::HOST_NAME)
             .map(str::to_string)
     }
+
+    /// JA4 TLS client fingerprint computed from the ClientHello, if available.
+    pub fn ja4_fingerprint(&self) -> Option<String> {
+        self.ssl.ssl().ex_data(ja4_ex_index()).cloned()
+    }
+}
+
+fn ja4_ex_index() -> Index<Ssl, String> {
+    *JA4_EX_INDEX.get_or_init(|| Ssl::new_ex_index::<String>().expect("SSL ex-data index"))
 }
 
 impl<IO: AsyncWriteRent> BoringStream<IO> {
@@ -525,6 +546,9 @@ mod tests {
         let server = async move {
             let (sock, _) = listener.accept().await.unwrap();
             let mut tls = acceptor.accept(sock).await.unwrap();
+            let ja4 = tls.ja4_fingerprint().unwrap();
+            assert!(ja4.starts_with('t'));
+            assert_eq!(ja4.len(), 36);
             // Echo one message.
             let (r, buf) = tls.read(vec![0u8; 64]).await;
             let n = r.unwrap();

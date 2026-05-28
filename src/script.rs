@@ -186,6 +186,9 @@ pub struct ConnectionInfo {
     /// ClientHello). `Some(false)` covers both "client offered a stale/no
     /// config" and "client did not offer ECH".
     pub ech_accepted: Option<bool>,
+    /// JA4 TLS client fingerprint computed from the ClientHello. `None` for
+    /// plaintext connections or if the ClientHello could not be parsed.
+    pub tls_client_ja4: Option<String>,
 }
 
 #[derive(Clone, Debug)]

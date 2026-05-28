@@ -303,6 +303,7 @@ async fn run_tls_listener(
                         inner_sni: tls_stream.server_name(),
                         outer_sni,
                         ech_accepted,
+                        tls_client_ja4: tls_stream.ja4_fingerprint(),
                     };
                     if is_h2 {
                         let io = StreamWrapper::new(tls_stream);

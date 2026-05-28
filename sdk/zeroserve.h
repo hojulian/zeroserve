@@ -107,6 +107,8 @@ extern zs_s64 zs_req_peer(char *out, zs_u64 out_len);
  *   "sni"     (object)       - { "inner": string|null, "outer": string|null }
  *   "ech"     (object|null)  - null when the server has no ECH keys loaded;
  *                              otherwise { "accepted": bool }
+ *   "fingerprint" (object)   - { "ja4": string|null } for the TLS client JA4
+ *                              fingerprint; null on plaintext connections
  *
  * "sni.inner" is the server name being served: the real, protected name when
  * ECH was accepted, or the cleartext SNI for plain TLS. "sni.outer" is the
@@ -118,6 +120,9 @@ extern zs_s64 zs_req_peer(char *out, zs_u64 out_len);
  * on this connection (the client offered a stale/absent config and is being
  * served against the public-name certificate). On rejection BoringSSL returns
  * retry_configs to the client automatically.
+ *
+ * "fingerprint.ja4" is the JA4 TLS client fingerprint computed from the
+ * ClientHello, for example "t13d1516h2_8daaf6152771_e5627efa2ab1".
  */
 extern zs_s64 zs_connection_info(void);
 

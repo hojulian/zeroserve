@@ -5,6 +5,7 @@ mod ech;
 mod helpers;
 mod http;
 mod hupwatch;
+mod ja4;
 mod json;
 mod logging;
 mod oidc;

@@ -1,10 +1,12 @@
 import { assert, assertEquals } from "@std/assert";
 import { join } from "@std/path";
 import {
+    generateSelfSignedCert,
     hasBpfToolchain,
     packSite,
     repoRoot,
     withZeroserve,
+    withZeroserveTls,
 } from "./test_utils.ts";
 
 const canRunScripts = await hasBpfToolchain();
@@ -566,13 +568,48 @@ Deno.test({
                     alpn: string | null;
                     sni: { inner: string | null; outer: string | null };
                     ech: unknown;
+                    fingerprint: { ja4: string | null };
                 };
                 assertEquals(body.tls, false);
                 assertEquals(body.alpn, null);
                 assertEquals(body.sni.inner, null);
                 assertEquals(body.sni.outer, null);
                 assertEquals(body.ech, null);
+                assertEquals(body.fingerprint.ja4, null);
             });
+
+            const cert = await generateSelfSignedCert();
+            try {
+                await withZeroserveTls(
+                    tarPath,
+                    cert.certPath,
+                    cert.keyPath,
+                    async (_httpUrl, httpsUrl) => {
+                        const caCert = await Deno.readTextFile(cert.certPath);
+                        const client = Deno.createHttpClient({ caCerts: [caCert] });
+                        try {
+                            const res = await fetch(`${httpsUrl}/conn`, { client });
+                            assertEquals(res.status, 200);
+                            const body = (await res.json()) as {
+                                tls: boolean;
+                                ech: unknown;
+                                fingerprint: { ja4: string | null };
+                            };
+                            assertEquals(body.tls, true);
+                            assertEquals(body.ech, null);
+                            assert(body.fingerprint.ja4 !== null);
+                            assert(
+                                /^t[0-9sd]{2}[di][0-9]{4}[A-Za-z0-9]{2}_[0-9a-f]{12}_[0-9a-f]{12}$/
+                                    .test(body.fingerprint.ja4),
+                            );
+                        } finally {
+                            client.close();
+                        }
+                    },
+                );
+            } finally {
+                await cert.cleanup();
+            }
         } finally {
             if (tarPath) await Deno.remove(tarPath).catch(() => {});
             await Deno.remove(siteDir, { recursive: true }).catch(() => {});

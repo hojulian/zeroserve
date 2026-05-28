@@ -93,7 +93,8 @@ pub fn h_load_file_metadata(
 ///   "tls": true,
 ///   "alpn": "h2",
 ///   "sni": { "inner": "secret.internal", "outer": "public.example.com" },
-///   "ech": { "accepted": true }
+///   "ech": { "accepted": true },
+///   "fingerprint": { "ja4": "t13d1516h2_8daaf6152771_e5627efa2ab1" }
 /// }
 /// ```
 ///
@@ -110,6 +111,7 @@ pub fn h_load_file_metadata(
 ///   ClientHello and the real SNI is protected; `false` means ECH was not
 ///   accepted on this connection (client offered a stale/absent config and is
 ///   being served against the public-name certificate).
+/// - `fingerprint` — TLS client fingerprints; currently `{ "ja4": string|null }`.
 pub fn h_connection_info(
     scope: &async_ebpf::program::HelperScope,
     _: u64,
@@ -132,6 +134,9 @@ pub fn h_connection_info(
                 "outer": conn.outer_sni,
             },
             "ech": ech,
+            "fingerprint": {
+                "ja4": conn.tls_client_ja4,
+            },
         });
         ctx.alloc_memory_footprint(estimate_json_memory_usage(&json) as u64)?;
         let r = JsonRef::new(json);

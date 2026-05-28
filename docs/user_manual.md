@@ -450,9 +450,11 @@ Request inspection:
 - `zs_connection_info()` returns a JSON object handle describing the
   underlying connection: `{ "tls": bool, "alpn": string|null, "sni": {
   "inner": string|null, "outer": string|null }, "ech": null | { "accepted":
-  bool } }`. `sni.inner` is the real (protected) server name when ECH was
-  accepted, else the cleartext SNI; `sni.outer` is the ECH public name when
-  ECH was accepted. Free with `zs_object_free`.
+  bool }, "fingerprint": { "ja4": string|null } }`. `sni.inner` is the real
+  (protected) server name when ECH was accepted, else the cleartext SNI;
+  `sni.outer` is the ECH public name when ECH was accepted. `fingerprint.ja4`
+  is the JA4 TLS client fingerprint computed from the ClientHello, or `null`
+  on plaintext connections. Free with `zs_object_free`.
 
 Request mutation:
 

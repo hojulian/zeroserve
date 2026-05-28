@@ -1,4 +1,4 @@
-/* Echo the connection's transport state (TLS / ALPN / ECH) as a JSON body.
+/* Echo the connection's transport state (TLS / ALPN / ECH / JA4) as a JSON body.
  * Useful as a debug endpoint to confirm TLS and ECH posture from a client. */
 #include <zeroserve.h>
 

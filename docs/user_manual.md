@@ -251,6 +251,8 @@ Flow and behavior:
 - If a script calls `zs_respond`, its response is sent and later scripts are skipped.
 - If a script calls `zs_reverse_proxy`, the request is proxied and later scripts are skipped.
 - Script failures are logged but do not abort the chain.
+- A script may also export `zeroserve.call.<name>` functions (via `ZS_CALL`) that
+  other scripts invoke with `zs_call`; see "Inter-script calls" below.
 
 ### Entry point
 
@@ -482,6 +484,52 @@ JSON response:
 
 - `zs_json_respond(status, json)` serializes the JSON handle to a response body,
   sets `Content-Type: application/json`, and sends the response.
+
+Inter-script calls:
+
+- `zs_call(script, script_len, func, func_len, json_handle)` invokes another
+  script's exported call function, passing a JSON handle and receiving one back.
+  Returns a new JSON object handle (free it with `zs_object_free`), or `-1` if
+  the call could not be completed: unknown script or function, the callee
+  trapped or returned a negative handle, or the maximum call depth (8) was
+  reached. `script` names the target script file with or without the `.o`
+  extension.
+- Expose a callable from a script with the `ZS_CALL(name)` macro. It places the
+  function in the `zeroserve.call.<name>` code section and gives it the
+  signature `zs_s64 on_call(zs_s64 json_handle)` — it receives the inbound JSON
+  handle by value and returns a JSON handle:
+
+  ```c
+  // greeter.c — callee; exposes greet, but no request entrypoint of its own.
+  ZS_CALL(greet) {
+    zs_s64 out = zs_json_new_object();
+    zs_s64 value = zs_json_new_object();
+    zs_json_set_string(value, ZS_STR("Hello!"));
+    zs_json_set(out, ZS_STR("greeting"), value);
+    zs_object_free(value);
+    return out;
+  }
+  ```
+
+  ```c
+  // gateway.c — caller.
+  ZS_ENTRY
+  zs_u64 entry(void) {
+    zs_s64 payload = zs_json_new_object();
+    zs_s64 reply = zs_call(ZS_STR("greeter"), ZS_STR("greet"), payload);
+    zs_object_free(payload);
+    if (reply < 0) { zs_respond(502, ZS_STR("call failed\n")); return 0; }
+    zs_json_respond(200, reply);
+    zs_object_free(reply);
+    return 0;
+  }
+  ```
+
+  The input JSON is deep-copied into a fresh, isolated context for the callee
+  and its return value is copied back, so the two scripts never share mutable
+  state. Calls may nest (a callee can `zs_call` again) up to a depth of 8; the
+  whole chain is torn down immediately if the client disconnects. See
+  `examples/call_gateway.c` and `examples/call_greeter.c`.
 
 Request inspection:
 

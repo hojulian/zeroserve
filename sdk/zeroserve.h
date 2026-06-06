@@ -18,6 +18,25 @@ typedef long ssize_t;
 #define ZS_SECTION(name) __attribute__((section(name)))
 #define ZS_ENTRY ZS_SECTION("zeroserve.request")
 #define ZS_INLINE __attribute__((always_inline))
+
+/* Define a function callable from other scripts via
+ * zs_call(script, ..., "<name>", ..., json_handle). It is placed in the
+ * "zeroserve.call.<name>" code section and receives the inbound JSON handle by
+ * value, returning a JSON handle (or a negative value to signal failure):
+ *
+ *   ZS_CALL(greet) {
+ *     zs_s64 out = zs_json_new_object();
+ *     zs_json_set_string(out, ZS_STR("hello"));
+ *     return out;            // json_handle is the caller's argument
+ *   }
+ */
+#define ZS_CALL(name)                                                          \
+  static zs_s64 zs__call_body_##name(zs_s64 json_handle);                      \
+  ZS_SECTION("zeroserve.call." #name)                                          \
+  zs_s64 zs__call_entry_##name(zs_s64 *zs__call_input) {                       \
+    return zs__call_body_##name(*zs__call_input);                              \
+  }                                                                            \
+  static zs_s64 zs__call_body_##name(zs_s64 json_handle)
 #define ZS_MIN(a, b) ((a) < (b) ? (a) : (b))
 #define ZS_MAX(a, b) ((a) > (b) ? (a) : (b))
 
@@ -89,6 +108,22 @@ extern zs_s64 zs_json_set_i64(zs_u64 json, zs_s64 value);
 extern zs_s64 zs_json_set_bool(zs_u64 json, zs_u64 value);
 extern zs_s64 zs_json_set_null(zs_u64 json);
 extern zs_s64 zs_json_respond(zs_u64 status, zs_u64 json);
+
+/* Invoke another script's `zeroserve.call.<func>` entrypoint (defined with
+ * ZS_CALL), passing a JSON handle and receiving one back. `script` names the
+ * target script file (with or without the `.o` extension); `func` is the
+ * exported call name. The input JSON is deep-copied into the callee, and its
+ * returned JSON is copied back as a fresh handle in the caller's object table.
+ *
+ * Returns a new JSON object handle on success (free it with zs_object_free), or
+ * -1 if the call could not be completed: unknown script or function, the callee
+ * trapped or returned a negative handle, or the maximum call depth was reached.
+ * The two string arguments pair naturally with ZS_STR:
+ *
+ *   zs_s64 reply = zs_call(ZS_STR("greeter"), ZS_STR("greet"), payload);
+ */
+extern zs_s64 zs_call(const char *script, zs_u64 script_len, const char *func,
+                      zs_u64 func_len, zs_s64 json_handle);
 
 extern zs_s64 zs_req_body_json(void);
 

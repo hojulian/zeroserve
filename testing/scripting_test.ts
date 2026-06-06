@@ -2534,3 +2534,271 @@ zs_u64 entry(void) {
         }
     },
 });
+
+// Shared by the re-entrancy and depth-limit tests below. A single script that
+// is both the request gateway and a callee: its `recurse` call function invokes
+// itself through `zs_call`, decrementing "remaining" until it bottoms out. Each
+// frame reports the total depth it observed and whether the runtime's call-depth
+// ceiling was hit (`zs_call` returning -1).
+const RECURSE_SCRIPT = String.raw`#include <zeroserve.h>
+
+static ZS_INLINE void set_i64(zs_s64 obj, const char *key, zs_u64 klen,
+                              zs_s64 v) {
+  zs_s64 n = zs_json_new_object();
+  zs_json_set_i64(n, v);
+  zs_json_set(obj, key, klen, n);
+  zs_object_free(n);
+}
+
+static ZS_INLINE zs_s64 get_i64(zs_s64 obj, const char *key, zs_u64 klen) {
+  zs_s64 value = 0;
+  zs_s64 node = zs_json_get(obj, key, klen);
+  if (node >= 0) {
+    zs_json_read_i64(node, &value, sizeof(value));
+    zs_object_free(node);
+  }
+  return value;
+}
+
+ZS_CALL(recurse) {
+  zs_s64 remaining = get_i64(json_handle, ZS_STR("remaining"));
+
+  zs_s64 out = zs_json_new_object();
+  if (remaining <= 0) {
+    set_i64(out, ZS_STR("depth"), 0);
+    set_i64(out, ZS_STR("limited"), 0);
+    return out;
+  }
+
+  zs_s64 child_in = zs_json_new_object();
+  set_i64(child_in, ZS_STR("remaining"), remaining - 1);
+  zs_s64 child = zs_call(ZS_STR("recurse"), ZS_STR("recurse"), child_in);
+  zs_object_free(child_in);
+
+  if (child < 0) {
+    /* The runtime refused to nest any deeper. */
+    set_i64(out, ZS_STR("depth"), remaining);
+    set_i64(out, ZS_STR("limited"), 1);
+    return out;
+  }
+
+  set_i64(out, ZS_STR("depth"), get_i64(child, ZS_STR("depth")) + 1);
+  set_i64(out, ZS_STR("limited"), get_i64(child, ZS_STR("limited")));
+  zs_object_free(child);
+  return out;
+}
+
+ZS_ENTRY
+zs_u64 entry(void) {
+  char path[32];
+  zs_req_path(path, sizeof(path));
+  if (zs_strcmp(path, "/recurse") != 0)
+    return 0;
+
+  char nbuf[16];
+  nbuf[0] = '\0';
+  zs_req_query_param(ZS_STR("n"), nbuf, sizeof(nbuf));
+  zs_s64 n = 0;
+  for (zs_s64 i = 0; nbuf[i] >= '0' && nbuf[i] <= '9'; i++)
+    n = n * 10 + (nbuf[i] - '0');
+
+  zs_s64 payload = zs_json_new_object();
+  set_i64(payload, ZS_STR("remaining"), n);
+  zs_s64 reply = zs_call(ZS_STR("recurse"), ZS_STR("recurse"), payload);
+  zs_object_free(payload);
+
+  if (reply < 0) {
+    zs_respond(502, ZS_STR("call failed\n"));
+    return 0;
+  }
+  zs_json_respond(200, reply);
+  zs_object_free(reply);
+  return 0;
+}
+`;
+
+async function buildRecurseSite(): Promise<
+    { siteDir: string; tarPath: string }
+> {
+    const siteDir = await Deno.makeTempDir();
+    await Deno.writeTextFile(join(siteDir, "index.html"), "recurse\n");
+    const scriptsDir = join(siteDir, ".zeroserve", "scripts");
+    await Deno.mkdir(scriptsDir, { recursive: true });
+    await Deno.writeTextFile(join(scriptsDir, "recurse.c"), RECURSE_SCRIPT);
+    const tarPath = await packSite(siteDir);
+    return { siteDir, tarPath };
+}
+
+Deno.test({
+    name: "e2e: inter-script call re-entrancy (nested zs_call)",
+    ignore: !canRunScripts,
+    fn: async () => {
+        const { siteDir, tarPath } = await buildRecurseSite();
+        try {
+            await withZeroserve(tarPath, async (baseUrl) => {
+                // A single, non-nested call still resolves the callee.
+                const one = await fetch(`${baseUrl}/recurse?n=1`);
+                assertEquals(one.status, 200);
+                assertEquals(await one.json(), { depth: 1, limited: 0 });
+
+                // Several frames of the same script re-entering itself through
+                // zs_call. depth == n proves every nested frame ran and unwound.
+                const five = await fetch(`${baseUrl}/recurse?n=5`);
+                assertEquals(five.status, 200);
+                assertEquals(await five.json(), { depth: 5, limited: 0 });
+            });
+        } finally {
+            await Deno.remove(tarPath).catch(() => {});
+            await Deno.remove(siteDir, { recursive: true }).catch(() => {});
+        }
+    },
+});
+
+Deno.test({
+    name: "e2e: inter-script call depth limit is enforced",
+    ignore: !canRunScripts,
+    fn: async () => {
+        const { siteDir, tarPath } = await buildRecurseSite();
+        try {
+            await withZeroserve(tarPath, async (baseUrl) => {
+                // MAX_CALL_DEPTH is 8: the request runs at depth 0 and each
+                // zs_call adds one, so up to 7 nested recurse frames complete
+                // before the 8th is refused. n=7 is the last fully-successful
+                // depth.
+                const ok = await fetch(`${baseUrl}/recurse?n=7`);
+                assertEquals(ok.status, 200);
+                assertEquals(await ok.json(), { depth: 7, limited: 0 });
+
+                // One past the ceiling: the chain is truncated and the limit is
+                // reported rather than the runtime recursing without bound.
+                const limited = await fetch(`${baseUrl}/recurse?n=8`);
+                assertEquals(limited.status, 200);
+                assertEquals(
+                    (await limited.json() as { limited: number }).limited,
+                    1,
+                );
+
+                // Far past the ceiling behaves identically — no crash, no hang.
+                const deep = await fetch(`${baseUrl}/recurse?n=50`);
+                assertEquals(deep.status, 200);
+                assertEquals(
+                    (await deep.json() as { limited: number }).limited,
+                    1,
+                );
+            });
+        } finally {
+            await Deno.remove(tarPath).catch(() => {});
+            await Deno.remove(siteDir, { recursive: true }).catch(() => {});
+        }
+    },
+});
+
+// A two-level call chain whose deepest frame spins forever. The gateway calls
+// `outer`, which calls `inner`, which never returns — so the /spin request can
+// only ever terminate by being cancelled. Any other path responds normally,
+// letting us prove the server stayed healthy after the chain was torn down.
+const SPIN_SCRIPT = String.raw`#include <zeroserve.h>
+
+ZS_CALL(inner) {
+  volatile zs_u64 place = 0;
+  while (1)
+    place += 1;
+  return 0; /* unreachable */
+}
+
+ZS_CALL(outer) {
+  zs_s64 in = zs_json_new_object();
+  zs_s64 r = zs_call(ZS_STR("spin"), ZS_STR("inner"), in);
+  zs_object_free(in);
+  return r; /* unreachable: inner never returns */
+}
+
+ZS_ENTRY
+zs_u64 entry(void) {
+  char path[32];
+  zs_req_path(path, sizeof(path));
+  if (zs_strcmp(path, "/spin") == 0) {
+    zs_s64 in = zs_json_new_object();
+    zs_s64 r = zs_call(ZS_STR("spin"), ZS_STR("outer"), in);
+    zs_object_free(in);
+    zs_json_respond(200, r); /* unreachable unless cancelled */
+    return 0;
+  }
+  zs_respond(200, ZS_STR("ok\n"));
+  return 0;
+}
+`;
+
+Deno.test({
+    name: "e2e: request cancellation tears down the whole call chain",
+    ignore: !canRunScripts,
+    fn: async () => {
+        const siteDir = await Deno.makeTempDir();
+        let tarPath: string | null = null;
+        try {
+            await Deno.writeTextFile(join(siteDir, "index.html"), "spin\n");
+            const scriptsDir = join(siteDir, ".zeroserve", "scripts");
+            await Deno.mkdir(scriptsDir, { recursive: true });
+            await Deno.writeTextFile(join(scriptsDir, "spin.c"), SPIN_SCRIPT);
+            tarPath = await packSite(siteDir);
+
+            await withZeroserve(tarPath, async (baseUrl) => {
+                // Baseline: the server serves a normal request.
+                const before = await fetch(`${baseUrl}/healthz`);
+                assertEquals(before.status, 200);
+                assertEquals(await before.text(), "ok\n");
+
+                // Fire a request whose call chain spins forever, then abort it.
+                // It can never resolve on its own, so a prompt AbortError proves
+                // the in-flight chain was cancelled rather than left running.
+                const controller = new AbortController();
+                const spinning = fetch(`${baseUrl}/spin`, {
+                    signal: controller.signal,
+                });
+                const settled = spinning.then(
+                    () => "resolved",
+                    (err) => (err as Error).name,
+                );
+
+                // Give the chain time to enter the spin, then cancel.
+                await new Promise((r) => setTimeout(r, 300));
+                controller.abort();
+
+                let cancelTimer: number | undefined;
+                const cancelDeadline = new Promise<string>((resolve) => {
+                    cancelTimer = setTimeout(() => resolve("timeout"), 5000);
+                });
+                const outcome = await Promise.race([settled, cancelDeadline]);
+                clearTimeout(cancelTimer);
+                assertEquals(
+                    outcome,
+                    "AbortError",
+                    "spinning request should reject with AbortError, not hang or resolve",
+                );
+
+                // The single-threaded worker must be free again immediately: a
+                // normal request right after cancellation still succeeds fast.
+                let afterTimer: number | undefined;
+                const afterDeadline = new Promise<Response | null>((resolve) => {
+                    afterTimer = setTimeout(() => resolve(null), 5000);
+                });
+                const after = await Promise.race([
+                    fetch(`${baseUrl}/healthz`),
+                    afterDeadline,
+                ]);
+                clearTimeout(afterTimer);
+                assert(
+                    after !== null,
+                    "server should keep serving after the chain was cancelled",
+                );
+                assertEquals(after.status, 200);
+                assertEquals(await after.text(), "ok\n");
+            });
+        } finally {
+            if (tarPath) {
+                await Deno.remove(tarPath).catch(() => {});
+            }
+            await Deno.remove(siteDir, { recursive: true }).catch(() => {});
+        }
+    },
+});

@@ -1,4 +1,5 @@
 pub mod aws_sign;
+pub mod call;
 pub mod crypto;
 pub mod encoding;
 pub mod generic;
@@ -8,6 +9,7 @@ pub mod ratelimit;
 pub mod vici;
 
 pub use aws_sign::*;
+pub use call::*;
 pub use crypto::*;
 pub use encoding::*;
 pub use generic::*;

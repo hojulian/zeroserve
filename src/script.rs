@@ -20,10 +20,18 @@ use ulid::Ulid;
 use url::form_urlencoded;
 
 use crate::helpers;
-use crate::{logging::async_log, site::Site, thread_pool::CPU_TP};
+use crate::{json::JsonRef, logging::async_log, site::Site, thread_pool::CPU_TP};
 
 const SCRIPT_ENTRYPOINT: &str = "zeroserve.request";
+/// Prefix for the per-function code sections that expose a script to inter-script
+/// calls. A callee exports `zeroserve.call.<name>` sections; `zs_call` resolves
+/// `<name>` against this prefix.
+pub(crate) const SCRIPT_CALL_SECTION_PREFIX: &str = "zeroserve.call.";
 const MAX_EXTERNAL_OBJECTS: usize = 32;
+/// Maximum depth of nested `zs_call` invocations. Bounds runaway recursion
+/// (script A calling B calling A …) and the total memory a single request can
+/// fan out across script contexts.
+pub(crate) const MAX_CALL_DEPTH: usize = 8;
 
 type BodyReaderFuture = Pin<Box<dyn std::future::Future<Output = Result<Vec<u8>, BodyReadError>>>>;
 
@@ -133,6 +141,7 @@ static SCRIPT_HELPERS: &[(&str, Helper)] = &[
     ("zs_json_set_null", helpers::h_json_set_null),
     ("zs_json_respond", helpers::h_json_respond),
     ("zs_object_free", helpers::h_object_free),
+    ("zs_call", helpers::h_call),
     ("zs_req_method", helpers::h_req_method),
     ("zs_req_path", helpers::h_req_path),
     ("zs_req_uri", helpers::h_req_uri),
@@ -326,9 +335,59 @@ pub struct ScriptExecutionContext {
     pub memory_footprint_bytes: u64,
     pub max_memory_footprint: u64,
     pub site: Arc<Site>,
+    /// All loaded scripts on this thread, shared so helpers (notably `zs_call`)
+    /// can resolve and invoke another script by name.
+    pub scripts: Rc<Vec<(String, Program)>>,
+    /// Thread environment, needed to arm preemption when running a callee.
+    pub t: ThreadEnv,
+    /// Current inter-script call nesting depth. The top-level request runs at
+    /// depth 0; each `zs_call` increments it for the callee.
+    pub call_depth: usize,
 }
 
 impl ScriptExecutionContext {
+    /// Build the execution context for a `zs_call` callee. The input JSON value
+    /// is installed as external object handle `1` — the handle the callee's
+    /// `zeroserve.call.<name>` entrypoint receives as its argument.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn for_call(
+        input: serde_json::Value,
+        request: ScriptRequest,
+        body_source: BodySource,
+        script_name: String,
+        site: Arc<Site>,
+        scripts: Rc<Vec<(String, Program)>>,
+        t: ThreadEnv,
+        max_memory_footprint: u64,
+        call_depth: usize,
+    ) -> Self {
+        let input_mem = helpers::estimate_json_memory_usage(&input) as u64;
+        let mut external_objects = ObjectRegistry {
+            next_idx: 2,
+            objects: HashMap::new(),
+        };
+        external_objects
+            .objects
+            .insert(1, Box::new(JsonRef::new(input)));
+        ScriptExecutionContext {
+            request,
+            body_source,
+            metadata: HashMap::new(),
+            response: None,
+            reverse_proxy: None,
+            script_name,
+            log_buffer: vec![],
+            external_objects,
+            error: String::new(),
+            memory_footprint_bytes: input_mem,
+            max_memory_footprint,
+            site,
+            scripts,
+            t,
+            call_depth,
+        }
+    }
+
     pub fn extobj<T: Any>(&mut self, idx: u64) -> Result<&mut T, ()> {
         self.external_objects
             .objects
@@ -491,15 +550,11 @@ impl ScriptRuntime {
         request: ScriptRequest,
         body_source: BodySource,
     ) -> anyhow::Result<ScriptOutcome> {
-        let timeslice = TimesliceConfig {
-            max_run_time_before_throttle: Duration::from_millis(20),
-            max_run_time_before_yield: Duration::from_millis(1),
-            throttle_duration: Duration::from_millis(100),
-        };
+        let timeslice = default_timeslice();
         let scripts = (*self.scripts.borrow()).clone();
         let outcome = run_request_scripts(
             self.t,
-            &scripts,
+            scripts,
             site,
             request,
             body_source,
@@ -512,9 +567,19 @@ impl ScriptRuntime {
     }
 }
 
+/// The default timeslice budget shared by the top-level request entrypoint and
+/// `zs_call` callees: throttle after 20ms of uninterrupted CPU, yield after 1ms.
+pub(crate) fn default_timeslice() -> TimesliceConfig {
+    TimesliceConfig {
+        max_run_time_before_throttle: Duration::from_millis(20),
+        max_run_time_before_yield: Duration::from_millis(1),
+        throttle_duration: Duration::from_millis(100),
+    }
+}
+
 async fn run_request_scripts(
     t: ThreadEnv,
-    scripts: &[(String, Program)],
+    scripts: Rc<Vec<(String, Program)>>,
     site: Arc<Site>,
     request: ScriptRequest,
     body_source: BodySource,
@@ -532,7 +597,7 @@ async fn run_request_scripts(
     let mut reverse_proxy: Option<String> = None;
     let preemption = PreemptionEnabled::new(t);
 
-    for (name, program) in scripts {
+    for (name, program) in scripts.iter() {
         if !program.has_section(SCRIPT_ENTRYPOINT) {
             continue;
         }
@@ -553,6 +618,9 @@ async fn run_request_scripts(
             memory_footprint_bytes: 0,
             max_memory_footprint,
             site: site.clone(),
+            scripts: scripts.clone(),
+            t,
+            call_depth: 0,
         };
         let mut resources: [&mut dyn Any; 1] = [&mut ctx];
         let run = program
@@ -641,7 +709,7 @@ pub fn deref_and_write_cstr(
     Ok(write_cstr(&[value.as_bytes()], &mut out))
 }
 
-struct MonoioTimeslicer;
+pub(crate) struct MonoioTimeslicer;
 
 impl Timeslicer for MonoioTimeslicer {
     fn sleep(&self, duration: Duration) -> impl Future<Output = ()> {

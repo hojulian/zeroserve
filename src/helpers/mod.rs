@@ -5,6 +5,7 @@ pub mod generic;
 pub mod json;
 pub mod oidc;
 pub mod ratelimit;
+pub mod vici;
 
 pub use aws_sign::*;
 pub use crypto::*;
@@ -13,3 +14,4 @@ pub use generic::*;
 pub use json::*;
 pub use oidc::*;
 pub use ratelimit::*;
+pub use vici::*;

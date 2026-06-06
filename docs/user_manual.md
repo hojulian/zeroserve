@@ -390,6 +390,19 @@ All four helpers take the config JSON handle as their first argument.
 > TLS connection, so per OIDC Core 3.1.3.7 its claims (`iss`/`aud`/`exp`/`nonce`)
 > are validated but its signature is not separately checked against a JWKS.
 
+strongSwan VICI:
+
+- `zs_vici_eap_identity_by_ip(ip, ip_len)` queries strongSwan's VICI
+  `list-sas` stream and returns a JSON object handle for the SA whose
+  `remote-host` or `remote-vips` matches `ip`. The VICI socket is
+  server-controlled via `$ZEROSERVE_VICI_SOCKET`; if the variable is unset,
+  this helper is disabled and returns `-1`. The environment value may be a path
+  or `unix://` URI.
+  Returns `0` when no SA matches and `-1` on bad input or VICI errors. The JSON
+  object includes `identity`/`remote_eap_id`, `remote_id`, `ike_name`,
+  `uniqueid`, `state`, `remote_host`, `remote_vips`, `matched_ip`, and
+  `matched_by`. Free the handle with `zs_object_free`.
+
 Example (gate the whole site behind login):
 ```c
 #include <zeroserve.h>

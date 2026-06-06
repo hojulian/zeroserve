@@ -159,6 +159,10 @@ static SCRIPT_HELPERS: &[(&str, Helper)] = &[
     ("zs_oidc_handle_callback", helpers::h_oidc_handle_callback),
     ("zs_oidc_session_verify", helpers::h_oidc_session_verify),
     ("zs_oidc_logout", helpers::h_oidc_logout),
+    (
+        "zs_vici_eap_identity_by_ip",
+        helpers::h_vici_eap_identity_by_ip,
+    ),
 ];
 
 static HELPER_TABLES: &[&[(&str, Helper)]] = &[SCRIPT_HELPERS];

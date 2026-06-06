@@ -300,6 +300,24 @@ extern zs_s64 zs_oidc_session_verify(zs_s64 cfg);
 extern zs_s64 zs_oidc_logout(zs_s64 cfg, const char *end_session_url,
                              zs_u64 end_session_url_len);
 
+/* strongSwan VICI helpers */
+
+/* Query active strongSwan IKE_SAs and find the SA whose remote-host or
+ * remote-vips contains `ip`. `ip` may be a plain IP, CIDR-like IP/prefix, or a
+ * socket address such as the value returned by zs_req_peer().
+ *
+ * The VICI socket is server-controlled via $ZEROSERVE_VICI_SOCKET. If the
+ * variable is unset, this helper is disabled and returns -1. The environment
+ * value may be a path or unix:// URI.
+ *
+ * Returns a JSON object handle on match, 0 if no SA matches, or -1 on invalid
+ * input / VICI errors. Free a returned handle with zs_object_free. The object
+ * contains "identity" (same as "remote_eap_id"), "remote_id", "ike_name",
+ * "uniqueid", "state", "local_host", "local_id", "remote_host",
+ * "remote_vips", "matched_ip", and "matched_by".
+ */
+extern zs_s64 zs_vici_eap_identity_by_ip(const char *ip, zs_u64 ip_len);
+
 extern void *zs_memcpy(void *dst, const void *src, size_t n);
 extern int zs_memcmp(const void *a, const void *b, size_t n);
 extern void *zs_memset(void *dst, int c, size_t n);

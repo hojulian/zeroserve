@@ -636,7 +636,7 @@ pub fn h_req_body_json(
     });
     Ok(0)
 }
-fn estimate_json_memory_usage(root: &serde_json::Value) -> usize {
+pub(crate) fn estimate_json_memory_usage(root: &serde_json::Value) -> usize {
     use serde_json::Value;
 
     let mut total: usize = 0;

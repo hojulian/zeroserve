@@ -295,7 +295,8 @@ def print_comparison(results):
             vals = ""
             for t in thread_counts:
                 r = idx.get((scenario, t))
-                vals += f"{f'{r[\"peak_pss_kb\"]/r[\"alive\"]:.2f}' if r else '—':>{col_w}}"
+                cell = f"{r['peak_pss_kb']/r['alive']:.2f}" if r else "—"
+                vals += f"{cell:>{col_w}}"
             print(f"  {scenario:<{label_w - 2}}{vals}")
 
 

@@ -7,7 +7,13 @@ Scenarios
 ---------
 static    Static file serving with eBPF middleware (health endpoint + custom header).
 kv-proxy  kv map lookup + request header strip + response header re-injection.
-all       Run both scenarios sequentially and print a side-by-side comparison.
+all       Run all scenario × thread-count combinations and print a comparison matrix.
+
+Thread counts
+-------------
+Pass --threads 1 4 8 (space-separated) to sweep multiple worker thread counts.
+Each scenario is run once per thread count; results are printed in a matrix table.
+Default: 1 thread.
 """
 
 import argparse
@@ -107,7 +113,7 @@ def run_wrk(port, extra_headers=()):
 
 # ── scenario runner ───────────────────────────────────────────────────────────
 
-def run_scenario(name):
+def run_scenario(name, threads=1):
     cfg = SCENARIOS[name]
     tarball = cfg["tarball"]
     extra_args = cfg["extra_args"]
@@ -143,7 +149,7 @@ def run_scenario(name):
                 pass
 
     print(f"\n{'=' * 60}")
-    print(f"SCENARIO: {name}")
+    print(f"SCENARIO: {name}  |  threads: {threads}")
     print(f"  {cfg['description']}")
     print(f"{'=' * 60}")
 
@@ -159,7 +165,8 @@ def run_scenario(name):
         port = BASE_PORT + i
         proc = subprocess.Popen(
             [ZEROSERVE, "--addr", f"127.0.0.1:{port}",
-             "--disable-request-logging", *extra_args, tarball],
+             "--disable-request-logging", "--threads", str(threads),
+             *extra_args, tarball],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
@@ -198,6 +205,7 @@ def run_scenario(name):
 
     return {
         "name": name,
+        "threads": threads,
         "description": cfg["description"],
         "tarball_mb": tarball_size,
         "startup_s": startup_time,
@@ -213,7 +221,7 @@ def run_scenario(name):
 def print_results(r):
     alive = r["alive"]
     print(f"\n{'=' * 50}")
-    print(f"RESULTS: {r['name']}")
+    print(f"RESULTS: {r['name']}  |  threads: {r['threads']}")
     print(f"{'=' * 50}")
     print(f"Instances started: {r['startup_s']:.2f}s  |  running: {alive}/{NUM_INSTANCES}")
     print(f"Load test duration: {r['wrk_s']:.2f}s")
@@ -235,23 +243,60 @@ def print_results(r):
 
 
 def print_comparison(results):
+    """Print a scenario × thread-count matrix for peak PSS per-instance (KB)."""
+    import itertools
+
+    scenarios = list(dict.fromkeys(r["name"] for r in results))
+    thread_counts = list(dict.fromkeys(r["threads"] for r in results))
+
+    # Index results by (name, threads)
+    idx = {(r["name"], r["threads"]): r for r in results}
+
+    col_w = 14
+    label_w = 40
+
+    def sep():
+        print("-" * (label_w + 1 + col_w * len(thread_counts)))
+
+    METRICS = [
+        ("Peak PSS total (MB)",        lambda r: f"{r['peak_pss_kb']/1024:.2f}"),
+        ("Peak PSS per-instance (KB)", lambda r: f"{r['peak_pss_kb']/r['alive']:.2f}"),
+        ("Peak RSS total (MB)",        lambda r: f"{r['peak_rss_kb']/1024:.2f}"),
+        ("System consumed (MB)",       lambda r: f"{r['peak_consumed_kb']/1024:.2f}"),
+        ("Startup time (s)",           lambda r: f"{r['startup_s']:.2f}"),
+        ("Load test time (s)",         lambda r: f"{r['wrk_s']:.2f}"),
+    ]
+
+    def matrix_section(scenario):
+        print(f"\n  scenario: {scenario}")
+        header = f"  {'Metric':<{label_w - 2}}" + "".join(f"{'t='+str(t):>{col_w}}" for t in thread_counts)
+        print(header)
+        sep()
+        for label, fn in METRICS:
+            vals = ""
+            for t in thread_counts:
+                r = idx.get((scenario, t))
+                vals += f"{fn(r) if r else '—':>{col_w}}"
+            print(f"  {label:<{label_w - 2}}{vals}")
+
     print(f"\n{'=' * 60}")
-    print("SCENARIO COMPARISON")
+    print("COMPARISON MATRIX")
     print(f"{'=' * 60}")
-    header = f"{'Metric':<40} " + "  ".join(f"{r['name']:>12}" for r in results)
-    print(header)
-    print("-" * len(header))
+    for scenario in scenarios:
+        matrix_section(scenario)
 
-    def row(label, fn):
-        vals = "  ".join(f"{fn(r):>12}" for r in results)
-        print(f"{label:<40} {vals}")
-
-    row("Peak PSS total (MB)",    lambda r: f"{r['peak_pss_kb']/1024:.2f}")
-    row("Peak PSS per-instance (KB)", lambda r: f"{r['peak_pss_kb']/r['alive']:.2f}")
-    row("Peak RSS total (MB)",    lambda r: f"{r['peak_rss_kb']/1024:.2f}")
-    row("System consumed (MB)",   lambda r: f"{r['peak_consumed_kb']/1024:.2f}")
-    row("Startup time (s)",       lambda r: f"{r['startup_s']:.2f}")
-    row("Load test time (s)",     lambda r: f"{r['wrk_s']:.2f}")
+    # Cross-scenario summary: per-instance PSS at each thread count
+    if len(scenarios) > 1:
+        print(f"\n  --- peak PSS per-instance (KB) across scenarios ---")
+        header = f"  {'Scenario':<{label_w - 2}}" + "".join(f"{'t='+str(t):>{col_w}}" for t in thread_counts)
+        print(header)
+        sep()
+        for scenario in scenarios:
+            vals = ""
+            for t in thread_counts:
+                r = idx.get((scenario, t))
+                vals += f"{f'{r[\"peak_pss_kb\"]/r[\"alive\"]:.2f}' if r else '—':>{col_w}}"
+            print(f"  {scenario:<{label_w - 2}}{vals}")
 
 
 # ── main ──────────────────────────────────────────────────────────────────────
@@ -261,14 +306,20 @@ def main():
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--scenario", choices=[*SCENARIOS, "all"], default="static",
                         help="Which scenario to run (default: static)")
+    parser.add_argument("--threads", type=int, nargs="+", default=[1], metavar="N",
+                        help="Worker thread counts to benchmark (default: 1). "
+                             "Pass multiple values to sweep, e.g. --threads 1 4 8")
     args = parser.parse_args()
 
     names = list(SCENARIOS) if args.scenario == "all" else [args.scenario]
+    thread_counts = sorted(set(args.threads))
+
     all_results = []
-    for name in names:
-        r = run_scenario(name)
-        print_results(r)
-        all_results.append(r)
+    for threads in thread_counts:
+        for name in names:
+            r = run_scenario(name, threads=threads)
+            print_results(r)
+            all_results.append(r)
 
     if len(all_results) > 1:
         print_comparison(all_results)

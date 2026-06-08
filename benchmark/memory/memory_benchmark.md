@@ -100,6 +100,15 @@ This exercises the full ingress/egress header-manipulation path representative o
 
 *`—` cells will be filled after `kv-proxy` is run on the benchmark machine.*
 
+### Peak PSS per-instance (KB) — thread-count sweep
+
+| Scenario    | t=1       | t=2 | t=4 | t=8 |
+| ----------- | --------- | --- | --- | --- |
+| `static`    | 1,189 KB  | —   | —   | —   |
+| `kv-proxy`  | —         | —   | —   | —   |
+
+*Run with `--scenario all --threads 1 2 4 8` to populate.*
+
 ## Reproducing the Benchmark
 
 ### Prerequisites
@@ -200,13 +209,18 @@ EOF
 ### Run
 
 ```bash
-# Single scenario
+# Single scenario, default 1 thread
 python3 benchmark/memory/benchmark.py --scenario static
 python3 benchmark/memory/benchmark.py --scenario kv-proxy
 
-# Both scenarios with side-by-side comparison
-python3 benchmark/memory/benchmark.py --scenario all
+# Sweep thread counts for one scenario
+python3 benchmark/memory/benchmark.py --scenario static --threads 1 4 8
+
+# Full matrix: all scenarios × all thread counts
+python3 benchmark/memory/benchmark.py --scenario all --threads 1 4 8
 ```
+
+The `--threads N` flag maps directly to zeroserve's `--threads` flag. Each instance is started with that many worker threads (each running its own io_uring event loop, sharing the site tarball and kv map via `SO_REUSEPORT`). More threads increase per-instance memory but allow each instance to saturate more CPU cores.
 
 ## Analysis
 

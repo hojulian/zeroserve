@@ -98,6 +98,11 @@ Key options:
   `421 Misdirected Request` response. Supports IPv4, IPv6 (bracket notation), and
   hostnames with optional ports (e.g., `example.com,api.example.com,[::1]`).
   Matching is case-insensitive and port numbers are stripped before comparison.
+- `--kv-map-file <FILE>`: Path to a JSON file containing a flat string-to-string
+  key-value map (e.g. `{"key": "value"}`). Scripts read values via `zs_kv_get`.
+  The file is watched via inotify and hot-reloaded automatically whenever it
+  changes — no restart or tarball repack needed. The mapping file lives on the
+  filesystem, not inside the tarball.
 
 Examples:
 
@@ -121,6 +126,9 @@ zeroserve --addr fd:3 --tls-addr fd:4 --cert cert.pem --key key.pem site.tar
 
 # Hostname validation (reject requests not matching allowed hostnames)
 zeroserve --validate-hostnames example.com,www.example.com,[::1] site.tar
+
+# Hot-reloadable key-value map for scripts (no restart needed when map changes)
+zeroserve --addr 0.0.0.0:8080 --kv-map-file /etc/myapp/routing.json site.tar
 ```
 
 ## Routing and file lookup
@@ -414,6 +422,26 @@ All four helpers take the config JSON handle as their first argument.
 > The id_token is fetched directly from the token endpoint over a server-validated
 > TLS connection, so per OIDC Core 3.1.3.7 its claims (`iss`/`aud`/`exp`/`nonce`)
 > are validated but its signature is not separately checked against a JWKS.
+
+Key-value map:
+
+- `zs_kv_get(key, key_len, out, out_len)` looks up `key` in the server-managed
+  key-value map (populated from `--kv-map-file`). Returns the number of bytes
+  written into `out` (NOT null-terminated), `0` if the key was not found, or
+  `-1` on error (invalid memory, no map configured). The map is a flat JSON
+  object with string keys and string values; it is hot-reloaded via inotify
+  whenever the file changes.
+
+  Example (proxy by execution ID):
+  ```c
+  char backend[256];
+  char exec_id[128];
+  zs_s64 id_len = zs_req_header("x-execution-id", 14, exec_id, sizeof(exec_id));
+  if (id_len <= 0) { zs_respond(400, ZS_STR("missing x-execution-id")); return 0; }
+  zs_s64 url_len = zs_kv_get(exec_id, id_len, backend, sizeof(backend));
+  if (url_len <= 0) { zs_respond(503, ZS_STR("no backend")); return 0; }
+  zs_reverse_proxy(backend, url_len);
+  ```
 
 strongSwan VICI:
 

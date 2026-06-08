@@ -36,6 +36,9 @@ zeroserve --addr 0.0.0.0:8080 --try-html site.tar
 # Honor PROXY protocol v1 headers (e.g. when behind a TCP load balancer)
 zeroserve --enable-proxy-protocol site.tar
 
+# Serve with a hot-reloadable key-value map accessible from scripts via zs_kv_get
+zeroserve --addr 0.0.0.0:8080 --kv-map-file mapping.json site.tar
+
 # Hot-reload certificate and site tarball
 killall -SIGHUP zeroserve
 ```

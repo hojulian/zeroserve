@@ -36,6 +36,15 @@
 - `zs_respond(status, body, body_len)`
 - `zs_reverse_proxy(backend_url, backend_url_len)`
 
+## Key-value map
+
+- `zs_kv_get(key, key_len, out, out_len)` looks up `key` in the server-managed
+  key-value map loaded from `--kv-map-file`. The map is a flat JSON object
+  (`{"key": "value"}`), hot-reloaded via inotify on file change. Returns:
+  - number of bytes written into `out` (NOT null-terminated) on success
+  - `0` if the key was not found
+  - `-1` on error (bad memory, no map configured)
+
 ## Logging, time, and environment
 
 - `zs_log(msg, len)`

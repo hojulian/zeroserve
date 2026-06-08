@@ -47,6 +47,7 @@ moka = { version = "0.12", features = ["future"] }
 tar = "0.4"
 chacha20poly1305 = "0.10"
 serde_vici = "0.1.5"
+notify = "6"
 
 [patch.crates-io]
 monoio = { git = "https://github.com/bytedance/monoio", rev = "212fde187f3d41f65ecd35b9cac80f7e246bb58e" }

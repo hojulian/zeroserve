@@ -1,13 +1,7 @@
-use std::{
-    collections::HashMap,
-    path::PathBuf,
-    sync::Arc,
-    time::Duration,
-};
+use std::{collections::HashMap, path::PathBuf, sync::Arc};
 
 use arc_swap::ArcSwap;
-
-const POLL_INTERVAL: Duration = Duration::from_secs(1);
+use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher, event::ModifyKind};
 
 pub struct VmMap {
     inner: ArcSwap<HashMap<String, String>>,
@@ -50,30 +44,69 @@ pub fn load_vm_map(path: &PathBuf) -> anyhow::Result<Arc<VmMap>> {
     Ok(vm_map)
 }
 
-/// Spawn a background thread that polls `path` every second. When the file
-/// content changes, the new JSON is parsed and atomically swapped in.
+/// Spawn a background thread that watches `path` via inotify (Linux) and
+/// hot-swaps the map whenever the file is written or replaced.
 pub fn spawn_vm_map_watcher(path: PathBuf, vm_map: Arc<VmMap>) {
     std::thread::Builder::new()
         .name("vm-map-watcher".into())
         .spawn(move || {
-            let mut last_contents = std::fs::read(&path).ok();
-            loop {
-                std::thread::sleep(POLL_INTERVAL);
-                if let Ok(contents) = std::fs::read(&path) {
-                    if last_contents.as_deref() != Some(&contents) {
-                        match vm_map.reload_from_bytes(&contents) {
-                            Ok(()) => eprintln!(
-                                "vm-map-watcher: reloaded {} entries from {}",
-                                vm_map.inner.load().len(),
-                                path.display()
-                            ),
-                            Err(err) => eprintln!(
-                                "vm-map-watcher: failed to reload {}: {err}",
-                                path.display()
-                            ),
-                        }
-                        last_contents = Some(contents);
+            let (tx, rx) = std::sync::mpsc::channel();
+            let mut watcher: RecommendedWatcher = match notify::recommended_watcher(tx) {
+                Ok(w) => w,
+                Err(e) => {
+                    eprintln!("vm-map-watcher: failed to create watcher: {e}");
+                    return;
+                }
+            };
+            // Watch the parent directory so rename-over (atomic write) is also caught.
+            let watch_path = path.parent().unwrap_or(&path);
+            if let Err(e) = watcher.watch(watch_path, RecursiveMode::NonRecursive) {
+                eprintln!("vm-map-watcher: failed to watch {}: {e}", watch_path.display());
+                return;
+            }
+
+            for result in rx {
+                let event = match result {
+                    Ok(e) => e,
+                    Err(e) => {
+                        eprintln!("vm-map-watcher: watch error: {e}");
+                        continue;
                     }
+                };
+
+                // Only react to data writes and renames (atomic file replacement).
+                let relevant = matches!(
+                    event.kind,
+                    EventKind::Modify(ModifyKind::Data(_))
+                        | EventKind::Modify(ModifyKind::Name(_))
+                        | EventKind::Create(_)
+                );
+                if !relevant {
+                    continue;
+                }
+
+                // Confirm the event touches our specific file.
+                let affects_our_file = event.paths.iter().any(|p| p == &path);
+                if !affects_our_file {
+                    continue;
+                }
+
+                match std::fs::read(&path) {
+                    Ok(contents) => match vm_map.reload_from_bytes(&contents) {
+                        Ok(()) => eprintln!(
+                            "vm-map-watcher: reloaded {} entries from {}",
+                            vm_map.len(),
+                            path.display()
+                        ),
+                        Err(e) => eprintln!(
+                            "vm-map-watcher: failed to reload {}: {e}",
+                            path.display()
+                        ),
+                    },
+                    Err(e) => eprintln!(
+                        "vm-map-watcher: failed to read {}: {e}",
+                        path.display()
+                    ),
                 }
             }
         })

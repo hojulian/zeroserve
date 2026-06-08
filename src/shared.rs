@@ -16,7 +16,7 @@ use crate::{
     config::StaticConfig,
     site::{Site, TarEntry},
     tls::TlsRuntime,
-    vmmap::VmMap,
+    kv_map::KvMap,
 };
 
 /// State shared across all worker event loops. Everything here is `Send + Sync`
@@ -30,8 +30,8 @@ pub struct SharedState {
     /// each worker can recompile them on reload without re-reading the CLI.
     pub plugin_sites: ArcSwap<Vec<Arc<Site>>>,
     pub tls: ArcSwapOption<TlsRuntime>,
-    /// Hot-reloadable ID→backend URL map, populated from `--vm-map-file`.
-    pub vm_map: ArcSwapOption<VmMap>,
+    /// Hot-reloadable string→string key-value map, populated from `--kv-map-file`.
+    pub kv_map: ArcSwapOption<KvMap>,
 }
 
 impl SharedState {
@@ -40,14 +40,14 @@ impl SharedState {
         site: Arc<Site>,
         plugin_sites: Vec<Arc<Site>>,
         tls: Option<TlsRuntime>,
-        vm_map: Option<Arc<VmMap>>,
+        kv_map: Option<Arc<KvMap>>,
     ) -> Self {
         Self {
             config,
             site: ArcSwap::new(site),
             plugin_sites: ArcSwap::new(Arc::new(plugin_sites)),
             tls: ArcSwapOption::from(tls.map(Arc::new)),
-            vm_map: ArcSwapOption::from(vm_map),
+            kv_map: ArcSwapOption::from(kv_map),
         }
     }
 

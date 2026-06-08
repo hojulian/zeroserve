@@ -19,7 +19,7 @@ mod shared;
 mod site;
 mod thread_pool;
 mod tls;
-mod vmmap;
+mod kv_map;
 
 use std::io::Write;
 use std::net::TcpListener;
@@ -162,11 +162,11 @@ fn main() -> Result<()> {
         eprintln!("TLS enabled");
     }
 
-    let vm_map = match &config.vm_map_file {
+    let kv_map = match &config.kv_map_file {
         Some(path) => {
-            let map = vmmap::load_vm_map(path)?;
-            eprintln!("loaded vm map from {} ({} entries)", path.display(), map.len());
-            vmmap::spawn_vm_map_watcher(path.clone(), map.clone());
+            let map = kv_map::load_kv_map(path)?;
+            eprintln!("loaded kv map from {} ({} entries)", path.display(), map.len());
+            kv_map::spawn_kv_map_watcher(path.clone(), map.clone());
             Some(map)
         }
         None => None,
@@ -182,7 +182,7 @@ fn main() -> Result<()> {
         site,
         plugin_sites,
         tls_runtime,
-        vm_map,
+        kv_map,
     ));
 
     // One reload channel per worker. The coordinator stages reloads on these:

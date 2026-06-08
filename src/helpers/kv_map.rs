@@ -2,13 +2,13 @@ use async_ebpf::program::HelperScope;
 
 use crate::script::{deref_and_write_cstr, read_utf8, with_ectx};
 
-/// Helper: `zs_vm_map_get(key, key_len, out, out_len) -> i64`
+/// Helper: `zs_kv_get(key, key_len, out, out_len) -> i64`
 ///
-/// Look up `key` in the server-managed VM map (populated from `--vm-map-file`).
+/// Look up `key` in the server-managed key-value map (populated from `--kv-map-file`).
 /// Returns the number of bytes written into `out`, 0 if the key is not found,
 /// or -1 on error (invalid memory, no map configured).
 /// The result is NOT null-terminated.
-pub fn h_vm_map_get(
+pub fn h_kv_get(
     scope: &HelperScope,
     key_ptr: u64,
     key_len: u64,
@@ -24,10 +24,10 @@ pub fn h_vm_map_get(
     // Returns Ok(None) = no map configured (-1), Ok(Some(None)) = key not found (0),
     // Ok(Some(Some(v))) = found.
     let lookup = with_ectx(scope, |ctx| {
-        let Some(ref vm_map) = ctx.vm_map else {
+        let Some(ref kv_map) = ctx.kv_map else {
             return Ok(None::<Option<String>>);
         };
-        Ok(Some(vm_map.get(&key)))
+        Ok(Some(kv_map.get(&key)))
     })?;
 
     match lookup {

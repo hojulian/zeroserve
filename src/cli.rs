@@ -180,8 +180,9 @@ pub struct Cli {
     #[arg(long, value_delimiter = ',')]
     pub validate_hostnames: Vec<String>,
 
-    /// Path to a JSON file mapping IDs to backend URLs (e.g. {"exec-id": "http://ip:port"}).
-    /// Polled every second; the map is hot-reloaded when the file content changes.
+    /// Path to a JSON file containing a string-to-string key-value map
+    /// (e.g. {"key": "value"}). Hot-reloaded via inotify whenever the file changes.
+    /// Accessible from scripts via `zs_kv_get`.
     #[arg(long, value_name = "FILE")]
-    pub vm_map_file: Option<PathBuf>,
+    pub kv_map_file: Option<PathBuf>,
 }

@@ -29,7 +29,7 @@ pub struct StaticConfig {
     pub max_request_external_memory_footprint: u64,
     pub max_rate_limit_buckets: usize,
     pub validate_hostnames: Vec<String>,
-    pub vm_map_file: Option<PathBuf>,
+    pub kv_map_file: Option<PathBuf>,
 }
 
 impl TryFrom<Cli> for StaticConfig {
@@ -111,7 +111,7 @@ impl TryFrom<Cli> for StaticConfig {
                 * 1024) as u64,
             max_rate_limit_buckets: cli.max_rate_limit_buckets,
             validate_hostnames: cli.validate_hostnames,
-            vm_map_file: cli.vm_map_file,
+            kv_map_file: cli.kv_map_file,
         })
     }
 }

@@ -16,7 +16,7 @@ BACKEND90_PID=$!
 echo "=== Starting zeroserve on :8080 ==="
 /app/target/release/zeroserve \
     --addr 127.0.0.1:8080 \
-    --vm-map-file /tmp/microvm-proxyd/vmmap.json \
+    --kv-map-file /tmp/microvm-proxyd/vmmap.json \
     --disable-ns-isolation \
     /tmp/proxy.tar > /tmp/zeroserve.log 2>&1 &
 ZS_PID=$!

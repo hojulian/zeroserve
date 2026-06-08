@@ -2,37 +2,56 @@
 """
 Zeroserve benchmark: Start 1000 instances, hit each with wrk, measure peak memory.
 Uses PSS (Proportional Set Size) for correct memory accounting with shared memory.
+
+Scenarios
+---------
+static    Static file serving with eBPF middleware (health endpoint + custom header).
+kv-proxy  kv map lookup + request header strip + response header re-injection.
+all       Run both scenarios sequentially and print a side-by-side comparison.
 """
 
-import subprocess
-import time
+import argparse
 import os
-import signal
+import subprocess
 import sys
-from pathlib import Path
-from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 ZEROSERVE = "./target/release/zeroserve"
-TARBALL = "/tmp/zeroserve-bench/site.tar"
 NUM_INSTANCES = 1000
 BASE_PORT = 10000
 WRK_DURATION = "1s"
 WRK_THREADS = 2
 WRK_CONNECTIONS = 10
 
-processes = []
-peak_memory = {"pss": 0, "rss": 0, "consumed": 0}
-peak_lock = threading.Lock()
-baseline_available = 0
-stop_monitoring = threading.Event()
+# ── scenario registry ─────────────────────────────────────────────────────────
 
+SCENARIOS = {
+    "static": {
+        "description": "Static file serving with eBPF middleware (health endpoint + custom header)",
+        "tarball": "/tmp/zeroserve-bench/site.tar",
+        "extra_args": [],
+        "wrk_headers": [],
+    },
+    "kv-proxy": {
+        "description": "kv map lookup + request header strip + response header re-injection",
+        "tarball": "/tmp/zeroserve-bench/kv-proxy.tar",
+        "extra_args": ["--kv-map-file", "/tmp/zeroserve-bench/kvmap.json"],
+        "wrk_headers": [
+            "-H", "x-execution-id: exec-bench",
+            "-H", "x-microvm-id: vm-42",
+        ],
+    },
+}
+
+# ── memory helpers ────────────────────────────────────────────────────────────
 
 def get_pss_kb(pid):
-    """Get PSS (Proportional Set Size) for a process - correct for shared memory."""
+    """PSS (Proportional Set Size) — correct for shared memory."""
     try:
         total = 0
-        with open(f"/proc/{pid}/smaps", "r") as f:
+        with open(f"/proc/{pid}/smaps") as f:
             for line in f:
                 if line.startswith("Pss:"):
                     total += int(line.split()[1])
@@ -42,208 +61,218 @@ def get_pss_kb(pid):
 
 
 def get_rss_kb(pid):
-    """Get RSS for a process - overcounts shared memory."""
+    """RSS — overcounts shared memory."""
     try:
-        with open(f"/proc/{pid}/statm", "r") as f:
+        with open(f"/proc/{pid}/statm") as f:
             pages = int(f.read().split()[1])
-            return pages * 4  # 4KB pages
+            return pages * 4
     except (FileNotFoundError, PermissionError):
         return 0
 
 
 def get_mem_available_kb():
-    """Get system MemAvailable from /proc/meminfo."""
-    with open("/proc/meminfo", "r") as f:
+    with open("/proc/meminfo") as f:
         for line in f:
             if line.startswith("MemAvailable:"):
                 return int(line.split()[1])
     return 0
 
 
-def get_total_memory():
-    """Get total PSS and RSS for all zeroserve processes."""
-    total_pss = 0
-    total_rss = 0
+def get_total_memory(processes):
+    total_pss = total_rss = 0
     for proc in processes:
-        if proc.poll() is None:  # Still running
+        if proc.poll() is None:
             total_pss += get_pss_kb(proc.pid)
             total_rss += get_rss_kb(proc.pid)
     return total_pss, total_rss
 
 
-def memory_monitor():
-    """Background thread to track peak memory usage."""
-    global peak_memory
-    while not stop_monitoring.is_set():
-        pss, rss = get_total_memory()
-        available = get_mem_available_kb()
-        consumed = baseline_available - available
+# ── wrk ───────────────────────────────────────────────────────────────────────
 
-        with peak_lock:
-            if pss > peak_memory["pss"]:
-                peak_memory["pss"] = pss
-            if rss > peak_memory["rss"]:
-                peak_memory["rss"] = rss
-            if consumed > peak_memory["consumed"]:
-                peak_memory["consumed"] = consumed
-
-        time.sleep(0.05)  # 50ms sampling
-
-
-def run_wrk(port):
-    """Run wrk against a single instance."""
+def run_wrk(port, extra_headers=()):
     try:
-        subprocess.run(
-            ["wrk", f"-t{WRK_THREADS}", f"-c{WRK_CONNECTIONS}", f"-d{WRK_DURATION}",
-             f"http://127.0.0.1:{port}/"],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            timeout=10
-        )
+        cmd = [
+            "wrk",
+            f"-t{WRK_THREADS}",
+            f"-c{WRK_CONNECTIONS}",
+            f"-d{WRK_DURATION}",
+            *extra_headers,
+            f"http://127.0.0.1:{port}/",
+        ]
+        subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10)
         return True
-    except Exception as e:
+    except Exception:
         return False
 
 
-def cleanup():
-    """Kill all zeroserve processes."""
-    print("Cleaning up...")
-    for proc in processes:
-        try:
-            proc.terminate()
-        except:
-            pass
-    time.sleep(0.5)
-    for proc in processes:
-        try:
-            proc.kill()
-        except:
-            pass
-    print("Cleanup complete.")
+# ── scenario runner ───────────────────────────────────────────────────────────
 
+def run_scenario(name):
+    cfg = SCENARIOS[name]
+    tarball = cfg["tarball"]
+    extra_args = cfg["extra_args"]
+    wrk_headers = cfg["wrk_headers"]
 
-def main():
-    global baseline_available, processes
+    processes = []
+    peak = {"pss": 0, "rss": 0, "consumed": 0}
+    peak_lock = threading.Lock()
+    stop_evt = threading.Event()
 
-    print(f"=== Zeroserve Benchmark: {NUM_INSTANCES} instances ===")
-    tarball_size = os.path.getsize(TARBALL) / (1024 * 1024)
-    print(f"Tarball: {TARBALL} ({tarball_size:.1f} MB)")
-    print()
+    def memory_monitor():
+        baseline = get_mem_available_kb()
+        while not stop_evt.is_set():
+            pss, rss = get_total_memory(processes)
+            consumed = baseline - get_mem_available_kb()
+            with peak_lock:
+                peak["pss"] = max(peak["pss"], pss)
+                peak["rss"] = max(peak["rss"], rss)
+                peak["consumed"] = max(peak["consumed"], consumed)
+            time.sleep(0.05)
 
-    # Record baseline memory
-    print("Recording baseline memory...")
+    def cleanup():
+        for p in processes:
+            try:
+                p.terminate()
+            except Exception:
+                pass
+        time.sleep(0.5)
+        for p in processes:
+            try:
+                p.kill()
+            except Exception:
+                pass
+
+    print(f"\n{'=' * 60}")
+    print(f"SCENARIO: {name}")
+    print(f"  {cfg['description']}")
+    print(f"{'=' * 60}")
+
+    tarball_size = os.path.getsize(tarball) / (1024 * 1024)
+    print(f"Tarball: {tarball} ({tarball_size:.1f} MB)")
+
     baseline_available = get_mem_available_kb()
     print(f"Baseline MemAvailable: {baseline_available} KB")
-    print()
 
-    # Start instances
-    print(f"Starting {NUM_INSTANCES} zeroserve instances...")
-    start_time = time.time()
-
+    print(f"\nStarting {NUM_INSTANCES} instances...")
+    t0 = time.time()
     for i in range(NUM_INSTANCES):
         port = BASE_PORT + i
         proc = subprocess.Popen(
-            [ZEROSERVE, "--addr", f"127.0.0.1:{port}", "--disable-request-logging", TARBALL],
+            [ZEROSERVE, "--addr", f"127.0.0.1:{port}",
+             "--disable-request-logging", *extra_args, tarball],
             stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL
+            stderr=subprocess.DEVNULL,
         )
         processes.append(proc)
-
         if (i + 1) % 100 == 0:
-            print(f"  Started {i + 1} instances...")
+            print(f"  {i + 1} started...")
+    startup_time = time.time() - t0
+    print(f"All started in {startup_time:.2f}s")
 
-    startup_time = time.time() - start_time
-    print(f"All instances started in {startup_time:.2f}s")
-    print()
-
-    # Wait for instances to initialize
-    print("Waiting for instances to initialize...")
     time.sleep(2)
+    alive = sum(1 for p in processes if p.poll() is None)
+    print(f"Running: {alive} / {NUM_INSTANCES}")
+    if alive < NUM_INSTANCES:
+        print("WARNING: some instances failed to start")
 
-    # Count running instances
-    alive_count = sum(1 for p in processes if p.poll() is None)
-    print(f"Running instances: {alive_count} / {NUM_INSTANCES}")
-    if alive_count < NUM_INSTANCES:
-        print("WARNING: Some instances failed to start!")
-    print()
+    pss_before, rss_before = get_total_memory(processes)
+    print(f"\nMemory before load:  PSS {pss_before/1024:.2f} MB  |  RSS {rss_before/1024:.2f} MB")
 
-    # Memory before load
-    print("=== Memory Before Load ===")
-    pss_before, rss_before = get_total_memory()
-    available_before = get_mem_available_kb()
-    consumed_before = baseline_available - available_before
+    monitor = threading.Thread(target=memory_monitor, daemon=True)
+    monitor.start()
 
-    print(f"Total PSS (correct): {pss_before} KB ({pss_before/1024:.2f} MB)")
-    print(f"Total RSS (inflated): {rss_before} KB ({rss_before/1024:.2f} MB)")
-    print(f"Per-instance PSS: {pss_before/alive_count:.2f} KB")
-    print(f"Memory consumed from baseline: {consumed_before} KB ({consumed_before/1024:.2f} MB)")
-    print()
+    print(f"\nRunning wrk ({WRK_DURATION}/instance, all concurrent)...")
+    t1 = time.time()
+    with ThreadPoolExecutor(max_workers=NUM_INSTANCES) as ex:
+        futs = [ex.submit(run_wrk, BASE_PORT + i, wrk_headers) for i in range(NUM_INSTANCES)]
+        done = 0
+        for _ in as_completed(futs):
+            done += 1
+            if done % 200 == 0:
+                print(f"  {done}/{NUM_INSTANCES} done...")
+    wrk_time = time.time() - t1
+    stop_evt.set()
+    print(f"Load test done in {wrk_time:.2f}s")
 
-    # Start memory monitoring
-    monitor_thread = threading.Thread(target=memory_monitor, daemon=True)
-    monitor_thread.start()
+    cleanup()
 
-    # Run wrk load test
-    print(f"=== Running wrk Load Test ({WRK_DURATION} per instance, all concurrent) ===")
-    wrk_start = time.time()
+    return {
+        "name": name,
+        "description": cfg["description"],
+        "tarball_mb": tarball_size,
+        "startup_s": startup_time,
+        "alive": alive,
+        "wrk_s": wrk_time,
+        "pss_before_kb": pss_before,
+        "peak_pss_kb": peak["pss"],
+        "peak_rss_kb": peak["rss"],
+        "peak_consumed_kb": peak["consumed"],
+    }
 
-    with ThreadPoolExecutor(max_workers=NUM_INSTANCES) as executor:
-        futures = [executor.submit(run_wrk, BASE_PORT + i) for i in range(NUM_INSTANCES)]
-        completed = 0
-        for future in as_completed(futures):
-            completed += 1
-            if completed % 200 == 0:
-                print(f"  {completed}/{NUM_INSTANCES} wrk tests completed...")
 
-    wrk_duration = time.time() - wrk_start
-    stop_monitoring.set()
-    print(f"Load test completed in {wrk_duration:.2f}s")
+def print_results(r):
+    alive = r["alive"]
+    print(f"\n{'=' * 50}")
+    print(f"RESULTS: {r['name']}")
+    print(f"{'=' * 50}")
+    print(f"Instances started: {r['startup_s']:.2f}s  |  running: {alive}/{NUM_INSTANCES}")
+    print(f"Load test duration: {r['wrk_s']:.2f}s")
     print()
+    print("Peak memory during load (PSS — correct):")
+    print(f"  Total:        {r['peak_pss_kb']/1024:.2f} MB")
+    print(f"  Per-instance: {r['peak_pss_kb']/alive:.2f} KB")
+    print()
+    print("Peak memory (RSS — inflated, for comparison):")
+    print(f"  Total:        {r['peak_rss_kb']/1024:.2f} MB")
+    print(f"  Per-instance: {r['peak_rss_kb']/alive:.2f} KB")
+    print()
+    print("System-wide memory consumed from baseline:")
+    print(f"  Peak:         {r['peak_consumed_kb']/1024:.2f} MB")
+    print(f"  Per-instance: {r['peak_consumed_kb']/alive:.2f} KB")
+    if r["peak_pss_kb"] > 0:
+        ratio = r["peak_rss_kb"] / r["peak_pss_kb"]
+        print(f"\nSharing ratio (RSS/PSS): {ratio:.2f}x")
 
-    # Memory after load
-    print("=== Memory After Load ===")
-    pss_after, rss_after = get_total_memory()
-    print(f"Total PSS (correct): {pss_after} KB ({pss_after/1024:.2f} MB)")
-    print(f"Total RSS (inflated): {rss_after} KB ({rss_after/1024:.2f} MB)")
-    print()
 
-    # Final summary
-    print("=" * 50)
-    print("=== BENCHMARK RESULTS ===")
-    print("=" * 50)
-    print()
-    print("Configuration:")
-    print(f"  Instances: {NUM_INSTANCES}")
-    print(f"  Site tarball: {tarball_size:.1f} MB")
-    print(f"  wrk: -t{WRK_THREADS} -c{WRK_CONNECTIONS} -d{WRK_DURATION}")
-    print()
-    print("Startup:")
-    print(f"  Time to start all instances: {startup_time:.2f}s")
-    print(f"  Running instances: {alive_count} / {NUM_INSTANCES}")
-    print()
-    print("Peak Memory During Load (CORRECT - using PSS):")
-    print(f"  Total PSS: {peak_memory['pss']} KB = {peak_memory['pss']/1024:.2f} MB")
-    print(f"  Per-instance: {peak_memory['pss']/alive_count:.2f} KB")
-    print()
-    print("Peak Memory (INCORRECT - using RSS, shown for comparison):")
-    print(f"  Total RSS: {peak_memory['rss']} KB = {peak_memory['rss']/1024:.2f} MB")
-    print(f"  Per-instance: {peak_memory['rss']/alive_count:.2f} KB")
-    print()
-    print("System-wide Memory Consumed from Baseline:")
-    print(f"  Peak: {peak_memory['consumed']} KB = {peak_memory['consumed']/1024:.2f} MB")
-    print(f"  Per-instance: {peak_memory['consumed']/alive_count:.2f} KB")
-    print()
-    if peak_memory['pss'] > 0:
-        print("Shared Memory Savings:")
-        print(f"  RSS overcount: {(peak_memory['rss'] - peak_memory['pss'])/1024:.2f} MB")
-        print(f"  Sharing ratio: {peak_memory['rss']/peak_memory['pss']:.2f}x")
-    print()
+def print_comparison(results):
+    print(f"\n{'=' * 60}")
+    print("SCENARIO COMPARISON")
+    print(f"{'=' * 60}")
+    header = f"{'Metric':<40} " + "  ".join(f"{r['name']:>12}" for r in results)
+    print(header)
+    print("-" * len(header))
+
+    def row(label, fn):
+        vals = "  ".join(f"{fn(r):>12}" for r in results)
+        print(f"{label:<40} {vals}")
+
+    row("Peak PSS total (MB)",    lambda r: f"{r['peak_pss_kb']/1024:.2f}")
+    row("Peak PSS per-instance (KB)", lambda r: f"{r['peak_pss_kb']/r['alive']:.2f}")
+    row("Peak RSS total (MB)",    lambda r: f"{r['peak_rss_kb']/1024:.2f}")
+    row("System consumed (MB)",   lambda r: f"{r['peak_consumed_kb']/1024:.2f}")
+    row("Startup time (s)",       lambda r: f"{r['startup_s']:.2f}")
+    row("Load test time (s)",     lambda r: f"{r['wrk_s']:.2f}")
+
+
+# ── main ──────────────────────────────────────────────────────────────────────
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__,
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--scenario", choices=[*SCENARIOS, "all"], default="static",
+                        help="Which scenario to run (default: static)")
+    args = parser.parse_args()
+
+    names = list(SCENARIOS) if args.scenario == "all" else [args.scenario]
+    all_results = []
+    for name in names:
+        r = run_scenario(name)
+        print_results(r)
+        all_results.append(r)
+
+    if len(all_results) > 1:
+        print_comparison(all_results)
 
 
 if __name__ == "__main__":
-    try:
-        main()
-    except KeyboardInterrupt:
-        print("\nInterrupted!")
-    finally:
-        cleanup()
+    main()

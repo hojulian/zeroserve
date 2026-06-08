@@ -1,16 +1,15 @@
 # Zeroserve Memory Benchmark Report
 
-This report documents the memory efficiency of running multiple concurrent zeroserve instances under load.
+This report documents the memory efficiency of running multiple concurrent zeroserve instances under load across two scenarios.
 
 ## Test Configuration
 
-| Parameter         | Value                                                   |
-| ----------------- | ------------------------------------------------------- |
-| Instances         | 1,000                                                   |
-| Site tarball size | 100 MB                                                  |
-| Middleware        | Userspace eBPF script (health endpoint + custom header) |
-| Load generator    | wrk -t2 -c10 -d1s per instance                          |
-| Load pattern      | All 1,000 instances hit concurrently                    |
+| Parameter         | Value                                                         |
+| ----------------- | ------------------------------------------------------------- |
+| Instances         | 1,000                                                         |
+| Site tarball size | 100 MB                                                        |
+| Load generator    | wrk -t2 -c10 -d1s per instance                                |
+| Load pattern      | All 1,000 instances hit concurrently                          |
 
 ### Scripting Runtime
 
@@ -49,68 +48,57 @@ Summing RSS (Resident Set Size) across processes is **incorrect** for measuring 
 6. Sample memory at 50ms intervals during load to capture peak
 7. Record final memory measurements
 
+## Scenarios
+
+### `static` — Static file serving with eBPF middleware
+
+Instances serve a 100 MB tarball. An eBPF middleware script handles a `/health` endpoint and injects a custom response header on every request.
+
+### `kv-proxy` — kv map lookup + header strip/re-inject
+
+Instances use `--kv-map-file` to load a routing table. An eBPF middleware script:
+
+1. Reads `x-execution-id` and `x-microvm-id` from the incoming request
+2. Looks up the backend URL by `exec-id` via `zs_kv_get`
+3. Pre-registers both headers for deferred re-injection on the response (`zs_meta_set("zs.response.header.*", ...)`)
+4. Strips both headers from the forwarded request (`zs_req_set_header(..., "", 0)`)
+5. Responds (or proxies)
+
+This exercises the full ingress/egress header-manipulation path representative of the `microvm-proxyd` use case.
+
 ## Results
 
 ### Startup Performance
 
-| Metric                         | Value                |
-| ------------------------------ | -------------------- |
-| Time to start 1,000 instances  | 4.76s                |
-| Instances successfully started | 1,000 / 1,000 (100%) |
-| Load test duration             | 5.83s                |
+| Metric                         | `static`             | `kv-proxy`           |
+| ------------------------------ | -------------------- | -------------------- |
+| Time to start 1,000 instances  | 4.76s                | —                    |
+| Instances successfully started | 1,000 / 1,000 (100%) | —                    |
+| Load test duration             | 5.83s                | —                    |
 
 ### Memory Before Load
 
-| Metric         | Total       | Per-instance |
-| -------------- | ----------- | ------------ |
-| PSS (correct)  | 717.08 MB   | 734 KB       |
-| RSS (inflated) | 4,966.69 MB | 5,086 KB     |
+| Metric         | `static` total | `static` per-instance | `kv-proxy` total | `kv-proxy` per-instance |
+| -------------- | -------------- | --------------------- | ---------------- | ----------------------- |
+| PSS (correct)  | 717.08 MB      | 734 KB                | —                | —                       |
+| RSS (inflated) | 4,966.69 MB    | 5,086 KB              | —                | —                       |
 
 ### Peak Memory During Load
 
-| Metric            | Total           | Per-instance |
-| ----------------- | --------------- | ------------ |
-| **PSS (correct)** | **1,160.84 MB** | **1,189 KB** |
-| RSS (inflated)    | 5,503.65 MB     | 5,636 KB     |
-| System consumed   | 1,581.08 MB     | 1,619 KB     |
+| Metric            | `static`        | `static` per-inst | `kv-proxy` | `kv-proxy` per-inst |
+| ----------------- | --------------- | ----------------- | ---------- | ------------------- |
+| **PSS (correct)** | **1,160.84 MB** | **1,189 KB**      | —          | —                   |
+| RSS (inflated)    | 5,503.65 MB     | 5,636 KB          | —          | —                   |
+| System consumed   | 1,581.08 MB     | 1,619 KB          | —          | —                   |
 
 ### Shared Memory Efficiency
 
-| Metric        | Value       |
-| ------------- | ----------- |
-| RSS overcount | 4,342.81 MB |
-| Sharing ratio | 4.74x       |
+| Metric        | `static`    | `kv-proxy` |
+| ------------- | ----------- | ---------- |
+| RSS overcount | 4,342.81 MB | —          |
+| Sharing ratio | 4.74x       | —          |
 
-The RSS measurement would incorrectly suggest ~5.5 GB of memory usage, while actual consumption is ~1.16 GB—a 4.74x difference due to shared memory.
-
-## Analysis
-
-### Per-Instance Overhead
-
-Under load with a 100 MB site tarball and active userspace eBPF middleware:
-
-- **~1.2 MB per instance** (PSS)
-- Memory growth during load: ~455 KB per instance (from 734 KB idle to 1,189 KB under load)
-
-### Memory Efficiency
-
-The low per-instance overhead is achieved through:
-
-1. **Shared binary mappings**: The zeroserve executable and linked libraries are shared across all instances via the OS page cache
-2. **Metadata-only indexing**: Only tarball metadata is held in memory (~100 bytes per file: path, byte offset, size, ETag, mtime). The 100 MB tarball's file content is never loaded into memory.
-3. **Streaming with positional reads**: File content is served on-demand via `read_at()` at the entry's byte offset, streamed in configurable chunks (default 64 KB) directly to the socket
-4. **Thread-local file handle cache**: Each thread maintains its own cloned file descriptor, enabling concurrent reads without contention
-5. **Compact script runtime**: The userspace eBPF VM (`async-ebpf`) has minimal overhead; compiled scripts are small (the test script is 1,824 bytes) and per-request context is bounded
-
-### Scalability Projection
-
-Based on these results, approximate memory requirements for larger deployments:
-
-| Instances | Estimated PSS | Notes     |
-| --------- | ------------- | --------- |
-| 1,000     | ~1.2 GB       | Measured  |
-| 5,000     | ~6 GB         | Projected |
-| 10,000    | ~12 GB        | Projected |
+*`—` cells will be filled after `kv-proxy` is run on the benchmark machine.*
 
 ## Reproducing the Benchmark
 
@@ -121,20 +109,17 @@ Based on these results, approximate memory requirements for larger deployments:
 - Built zeroserve binary (`cargo build --release`)
 - BPF toolchain (`clang`, `llc`) for script compilation
 
-### Setup
+### Setup: `static` scenario
 
 ```bash
-# Create test site
 mkdir -p /tmp/zeroserve-bench/site/.zeroserve/scripts
 
-# Generate 100MB content
+# 100 MB content
 dd if=/dev/urandom of=/tmp/zeroserve-bench/site/large-asset.bin bs=1M count=100
 
-# Create index page
 echo '<!DOCTYPE html><html><body><h1>Benchmark</h1></body></html>' \
   > /tmp/zeroserve-bench/site/index.html
 
-# Create middleware script
 cat > /tmp/zeroserve-bench/site/.zeroserve/scripts/10-middleware.c << 'EOF'
 #include <zeroserve.h>
 
@@ -154,25 +139,110 @@ zs_u64 entry(void) {
 }
 EOF
 
-# Pack tarball (compiles .c scripts to .o)
 ./target/release/zeroserve --pack /tmp/zeroserve-bench/site \
   > /tmp/zeroserve-bench/site.tar
 ```
 
-### Run Benchmark
-
-Save the benchmark script `benchmark.py` as `/tmp/zeroserve-bench/benchmark.py` and run:
+### Setup: `kv-proxy` scenario
 
 ```bash
-python3 /tmp/zeroserve-bench/benchmark.py
+mkdir -p /tmp/zeroserve-bench/kv-proxy-site/.zeroserve/scripts
+
+# kv map: exec-bench → dummy backend URL
+cat > /tmp/zeroserve-bench/kvmap.json << 'EOF'
+{"exec-bench": "http://127.0.0.1:9090"}
+EOF
+
+cat > /tmp/zeroserve-bench/kv-proxy-site/.zeroserve/scripts/proxy.c << 'EOF'
+#include <zeroserve.h>
+
+ZS_ENTRY
+zs_u64 entry(void) {
+    char exec_id[256];
+    zs_s64 exec_id_len = zs_req_header("x-execution-id", 14,
+                                        exec_id, sizeof(exec_id));
+    char vm_id[256];
+    zs_s64 vm_id_len   = zs_req_header("x-microvm-id", 12,
+                                        vm_id, sizeof(vm_id));
+
+    if (exec_id_len <= 0 || vm_id_len <= 0) {
+        zs_respond(400, ZS_STR("missing headers\n"));
+        return 0;
+    }
+
+    char backend_url[512];
+    zs_s64 url_len = zs_kv_get(exec_id, (zs_u64)exec_id_len,
+                                backend_url, sizeof(backend_url));
+    if (url_len <= 0) {
+        zs_respond(503, ZS_STR("no backend\n"));
+        return 0;
+    }
+
+    /* Pre-register headers to re-inject on the response (deferred) */
+    zs_meta_set(ZS_STR("zs.response.header.x-execution-id"),
+                exec_id, (zs_u64)exec_id_len);
+    zs_meta_set(ZS_STR("zs.response.header.x-microvm-id"),
+                vm_id, (zs_u64)vm_id_len);
+
+    /* Strip routing headers so the backend never sees them */
+    zs_req_set_header("x-execution-id", 14, "", 0);
+    zs_req_set_header("x-microvm-id", 12, "", 0);
+
+    zs_respond(200, ZS_STR("ok\n"));
+    return 0;
+}
+EOF
+
+./target/release/zeroserve --pack /tmp/zeroserve-bench/kv-proxy-site \
+  > /tmp/zeroserve-bench/kv-proxy.tar
 ```
+
+### Run
+
+```bash
+# Single scenario
+python3 benchmark/memory/benchmark.py --scenario static
+python3 benchmark/memory/benchmark.py --scenario kv-proxy
+
+# Both scenarios with side-by-side comparison
+python3 benchmark/memory/benchmark.py --scenario all
+```
+
+## Analysis
+
+### Per-Instance Overhead (`static`)
+
+Under load with a 100 MB site tarball and active userspace eBPF middleware:
+
+- **~1.2 MB per instance** (PSS)
+- Memory growth during load: ~455 KB per instance (from 734 KB idle to 1,189 KB under load)
+
+### Memory Efficiency
+
+The low per-instance overhead is achieved through:
+
+1. **Shared binary mappings**: The zeroserve executable and linked libraries are shared across all instances via the OS page cache
+2. **Metadata-only indexing**: Only tarball metadata is held in memory (~100 bytes per file: path, byte offset, size, ETag, mtime). The 100 MB tarball's file content is never loaded into memory.
+3. **Streaming with positional reads**: File content is served on-demand via `read_at()` at the entry's byte offset, streamed in configurable chunks (default 64 KB) directly to the socket
+4. **Thread-local file handle cache**: Each thread maintains its own cloned file descriptor, enabling concurrent reads without contention
+5. **Compact script runtime**: The userspace eBPF VM (`async-ebpf`) has minimal overhead; compiled scripts are small and per-request context is bounded
+
+### Scalability Projection (`static`)
+
+| Instances | Estimated PSS | Notes     |
+| --------- | ------------- | --------- |
+| 1,000     | ~1.2 GB       | Measured  |
+| 5,000     | ~6 GB         | Projected |
+| 10,000    | ~12 GB        | Projected |
 
 ## Conclusion
 
 Zeroserve demonstrates efficient memory utilization when running many concurrent instances:
 
-- **Peak memory: 1.16 GB** for 1,000 instances under concurrent load
+- **Peak memory: 1.16 GB** for 1,000 instances under concurrent load (`static` scenario)
 - **Per-instance overhead: ~1.2 MB** including a 100 MB site tarball and userspace eBPF middleware
 - **Shared memory savings: 4.74x** compared to naive RSS summation
+
+The `kv-proxy` scenario adds kv map lookup and per-request header manipulation on top of the base overhead; results pending.
 
 The userspace eBPF scripting model (via `async-ebpf`) provides sandboxed request processing with bounded per-request memory allocation and no kernel dependencies, making zeroserve portable and suitable for high-density deployments.

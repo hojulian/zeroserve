@@ -71,12 +71,13 @@ pub fn h_call(
             ctx.body_source.clone(),
             ctx.metadata.clone(),
             ctx.site.clone(),
+            ctx.vm_map.clone(),
             ctx.call_depth,
             ctx.max_memory_footprint,
         )))
     })?;
 
-    let Some((input, scripts, t, request, body_source, metadata, site, call_depth, max_mem)) =
+    let Some((input, scripts, t, request, body_source, metadata, site, vm_map, call_depth, max_mem)) =
         prepared
     else {
         return Ok(-1i64 as u64);
@@ -104,6 +105,7 @@ pub fn h_call(
                 metadata,
                 script_name.clone(),
                 site,
+                vm_map,
                 scripts.clone(),
                 t,
                 max_mem,

@@ -179,4 +179,9 @@ pub struct Cli {
     /// Comma-separated list of allowed hostnames. Requests with non-matching hostnames receive a 421 error.
     #[arg(long, value_delimiter = ',')]
     pub validate_hostnames: Vec<String>,
+
+    /// Path to a JSON file mapping IDs to backend URLs (e.g. {"exec-id": "http://ip:port"}).
+    /// Polled every second; the map is hot-reloaded when the file content changes.
+    #[arg(long, value_name = "FILE")]
+    pub vm_map_file: Option<PathBuf>,
 }

@@ -702,7 +702,7 @@ async fn handle_request<R: AsyncReadRent + 'static>(
     );
     let script_request_fallback = script_request.clone();
     let script_outcome = monoio::select! {
-        x = script_runtime.run_request(shared.site.load_full(), script_request, body_source) => x,
+        x = script_runtime.run_request(shared.site.load_full(), script_request, body_source, shared.vm_map.load_full()) => x,
         _ = &mut *interrupt => {
           async_log(format!("[handle] {}: interrupted\n", request_id).into_bytes()).await;
           let (reader, _) = body_state.borrow_mut().take().unwrap();
@@ -894,7 +894,7 @@ where
     let script_request_fallback = script_request.clone();
     let mut hup_wait = hup.clone();
     let script_outcome = monoio::select! {
-        x = script_runtime.run_request(shared.site.load_full(), script_request, body_source) => x,
+        x = script_runtime.run_request(shared.site.load_full(), script_request, body_source, shared.vm_map.load_full()) => x,
         _ = &mut hup_wait => {
           async_log(format!("[handle] {}: interrupted\n", request_id).into_bytes()).await;
           return Ok(());

@@ -354,6 +354,12 @@ extern zs_s64 zs_oidc_logout(zs_s64 cfg, const char *end_session_url,
  */
 extern zs_s64 zs_vici_eap_identity_by_ip(const char *ip, zs_u64 ip_len);
 
+/* Look up a key in the server-managed VM map (populated from --vm-map-file).
+ * Returns the number of bytes written to `out` (NOT null-terminated),
+ * 0 if the key was not found, or -1 on error (invalid memory, no map loaded). */
+extern zs_s64 zs_vm_map_get(const char *key, zs_u64 key_len,
+                             char *out, zs_u64 out_len);
+
 extern void *zs_memcpy(void *dst, const void *src, size_t n);
 extern int zs_memcmp(const void *a, const void *b, size_t n);
 extern void *zs_memset(void *dst, int c, size_t n);

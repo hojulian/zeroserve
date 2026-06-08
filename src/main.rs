@@ -19,6 +19,7 @@ mod shared;
 mod site;
 mod thread_pool;
 mod tls;
+mod vmmap;
 
 use std::io::Write;
 use std::net::TcpListener;
@@ -161,6 +162,16 @@ fn main() -> Result<()> {
         eprintln!("TLS enabled");
     }
 
+    let vm_map = match &config.vm_map_file {
+        Some(path) => {
+            let map = vmmap::load_vm_map(path)?;
+            eprintln!("loaded vm map from {} ({} entries)", path.display(), map.len());
+            vmmap::spawn_vm_map_watcher(path.clone(), map.clone());
+            Some(map)
+        }
+        None => None,
+    };
+
     eprintln!(
         "async preemption timer interval: {:?}",
         config.preempt_timer_interval
@@ -171,6 +182,7 @@ fn main() -> Result<()> {
         site,
         plugin_sites,
         tls_runtime,
+        vm_map,
     ));
 
     // One reload channel per worker. The coordinator stages reloads on these:

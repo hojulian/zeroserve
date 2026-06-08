@@ -7,6 +7,7 @@ pub mod json;
 pub mod oidc;
 pub mod ratelimit;
 pub mod vici;
+pub mod vmmap;
 
 pub use aws_sign::*;
 pub use call::*;
@@ -17,3 +18,4 @@ pub use json::*;
 pub use oidc::*;
 pub use ratelimit::*;
 pub use vici::*;
+pub use vmmap::*;

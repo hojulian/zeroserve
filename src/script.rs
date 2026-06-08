@@ -20,7 +20,7 @@ use ulid::Ulid;
 use url::form_urlencoded;
 
 use crate::helpers;
-use crate::{json::JsonRef, logging::async_log, site::Site, thread_pool::CPU_TP};
+use crate::{json::JsonRef, logging::async_log, site::Site, thread_pool::CPU_TP, vmmap::VmMap};
 
 const SCRIPT_ENTRYPOINT: &str = "zeroserve.request";
 /// Prefix for the per-function code sections that expose a script to inter-script
@@ -172,6 +172,7 @@ static SCRIPT_HELPERS: &[(&str, Helper)] = &[
         "zs_vici_eap_identity_by_ip",
         helpers::h_vici_eap_identity_by_ip,
     ),
+    ("zs_vm_map_get", helpers::h_vm_map_get),
 ];
 
 static HELPER_TABLES: &[&[(&str, Helper)]] = &[SCRIPT_HELPERS];
@@ -340,6 +341,9 @@ pub struct ScriptExecutionContext {
     pub memory_footprint_bytes: u64,
     pub max_memory_footprint: u64,
     pub site: Arc<Site>,
+    /// Server-managed VM map for `zs_vm_map_get`. `None` when `--vm-map-file`
+    /// is not configured.
+    pub vm_map: Option<Arc<VmMap>>,
     /// All loaded scripts on this thread, shared so helpers (notably `zs_call`)
     /// can resolve and invoke another script by name.
     pub scripts: Rc<Vec<(String, Program)>>,
@@ -362,6 +366,7 @@ impl ScriptExecutionContext {
         metadata: Rc<RefCell<HashMap<String, String>>>,
         script_name: String,
         site: Arc<Site>,
+        vm_map: Option<Arc<VmMap>>,
         scripts: Rc<Vec<(String, Program)>>,
         t: ThreadEnv,
         max_memory_footprint: u64,
@@ -388,6 +393,7 @@ impl ScriptExecutionContext {
             memory_footprint_bytes: input_mem,
             max_memory_footprint,
             site,
+            vm_map,
             scripts,
             t,
             call_depth,
@@ -555,6 +561,7 @@ impl ScriptRuntime {
         site: Arc<Site>,
         request: ScriptRequest,
         body_source: BodySource,
+        vm_map: Option<Arc<VmMap>>,
     ) -> anyhow::Result<ScriptOutcome> {
         let timeslice = default_timeslice();
         let scripts = (*self.scripts.borrow()).clone();
@@ -564,6 +571,7 @@ impl ScriptRuntime {
             site,
             request,
             body_source,
+            vm_map,
             &timeslice,
             &MonoioTimeslicer,
             self.max_memory_footprint,
@@ -589,6 +597,7 @@ async fn run_request_scripts(
     site: Arc<Site>,
     request: ScriptRequest,
     body_source: BodySource,
+    vm_map: Option<Arc<VmMap>>,
     timeslice: &TimesliceConfig,
     timeslicer: &impl Timeslicer,
     max_memory_footprint: u64,
@@ -627,6 +636,7 @@ async fn run_request_scripts(
             memory_footprint_bytes: 0,
             max_memory_footprint,
             site: site.clone(),
+            vm_map: vm_map.clone(),
             scripts: scripts.clone(),
             t,
             call_depth: 0,
